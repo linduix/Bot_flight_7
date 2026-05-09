@@ -3,8 +3,8 @@ import numpy as np
 
 @dataclass
 class Individual:
-    weights = np.ndarray
-    fitness = float
-    descriptors = tuple
-    stats = dict
-    tag = str
+    tag:         str
+    weights:     np.ndarray
+    fitness:     float|None = None
+    descriptors: tuple|None = None
+    stats:       list|None  = None

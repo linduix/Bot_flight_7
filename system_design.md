@@ -95,15 +95,16 @@ run(algorithm, simulator, emit_fn):
     best_fitness = -inf
 
     loop:
-        batch,      propose_stats = algorithm.propose(n, config)
-        evaluated,  sim_stats     = simulator.evaluate(batch, trial_pool, config)
-        update_stats              = algorithm.update(evaluated)
-        config,     stage_stats   = advance_stage(config, evaluated)
+        batch,        propose_stats = algorithm.propose(n, config)
+        sim_stats                   = simulator.evaluate(batch, trial_pool, config)  # mutates batch in place
+        update_stats                = algorithm.update(batch)
+        config,       stage_stats   = advance_stage(config, batch)
 
         if curriculum_advanced(stage_stats):
-            trial_pool               = generate_trial_pool(config)
-            revalidated, reval_stats = simulator.evaluate(algorithm.all_elites(), trial_pool, config)
-            algorithm.revalidate(revalidated)
+            trial_pool  = generate_trial_pool(config)
+            elites      = algorithm.all_elites()
+            reval_stats = simulator.evaluate(elites, trial_pool, config)  # mutates elites in place
+            algorithm.revalidate(elites)
 
         emit_fn({
             generation,

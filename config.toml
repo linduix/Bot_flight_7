@@ -1,0 +1,4 @@
+[network]
+layers = [25, 16, 16, 4]
+hidden_activation = "leaky_relu"
+output_activaiton = "tanh"
