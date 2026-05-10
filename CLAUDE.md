@@ -40,11 +40,33 @@ Individual Layer  →  wraps weight vector + last evaluation results (shared acr
 Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without touching other layers)
 ```
 
+### Simulation
+
+- **Implementation:** Custom 2D physics, batched JAX (`jit` + `vmap` + `lax.scan`)
+- **Target chain (per seed):** 5 waypoints, first at (0,0). Remaining 4 at random angles + random distances normalized to sum to fixed `total_chain_length`.
+- **Segment times (per seed):** 4 random durations normalized to sum to 80% of episode time `T`. Remaining 20% is the approach phase before touch.
+- **Spawn (per seed):** one of the 5 waypoints chosen uniformly. Same spawn for all drones on that seed (fairness).
+- **Touch trigger:** drone within `touch_radius` of target → chain movement begins. One-way (cannot un-trigger). Not scored — only gates chain.
+- **Chain motion:** linear interpolation between waypoints based on post-touch timer. Holds at final waypoint until `T`.
+- **Drone state (complex array, length 6):** position (x+iy), velocity (vx+ivy), angle, angular_velocity, t1_angle, t2_angle. Last 4 stored as complex with zero imag for uniform dtype.
+- **Action (MLP outputs, 4 floats):** t1_target_angle, t2_target_angle (thrusters slew toward these at rotation-speed limit), t1_thrust, t2_thrust (0–1, applied immediately, not stored).
+- **Fitness per tick:** `dt / (1 + distance_to_target)`. Multiplied by 0.01 pre-touch.
+- **Episode fitness:** sum over all ticks. **Drone fitness:** mean across all S seeds.
+- **Batching:** P drones × S seeds flattened to P×S parallel episodes. Chains pre-generated in NumPy, passed as static arrays. `lax.scan` over time, `vmap` over episodes.
+
 ### Network (Controller)
 
-- **Topology:** Fixed feedforward MLP, `25-16-16-4` (~720 params, under 1000-parameter constraint)
-- **Inputs (double-stacked):** current + previous timestep of [delta_position(2), angle(1), velocity(2), angular_velocity(1), thruster_angles(4), bias(1)] = 25 inputs total
-- **Outputs:** 4 continuous thruster angle commands
+- **Topology:** Fixed feedforward MLP, `14-16-16-4` (~512 params, under 1000-parameter constraint)
+- **Inputs (14 total):**
+  - delta_position_now (2, body frame)
+  - delta_position_prev (2, body frame) — only history, lets network infer target motion
+  - velocity (2, body frame)
+  - sin(angle), cos(angle) (2, world frame, gravity reference)
+  - angular_velocity (1)
+  - t1_angle, t2_angle (2, body frame, raw radians — clamped ±60° so no wrap)
+  - bias (1)
+- **Frame split:** angle world-frame (gravity reference); delta_position and velocity body-frame (rotation-invariant policy). Convert world→body via `value * exp(-1j * angle)`.
+- **Outputs:** thruster_angles(2) + thrust_magnitudes(2) = 4 continuous outputs
 - **Genome:** flat `float32` vector of all weights, direct encoding (no CPPN, no delta encoding)
 - **Bias:** handled as a bias node in the input layer, not as a separate learned parameter
 

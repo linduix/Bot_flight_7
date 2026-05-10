@@ -1,4 +1,19 @@
 [network]
-layers = [25, 16, 16, 4]
+layers = [14, 16, 16, 4]
 hidden_activation = "leaky_relu"
-output_activaiton = "tanh"
+output_activation = "tanh"
+
+[trainer]
+population = 10
+
+[drone]
+mass            = 4.0        # kg
+inertia         = 2.383      # kg*m^2
+width           = 2.0        # m
+height          = 0.175      # m
+gravity         = -9.81      # m/s^2, y axis
+
+thruster_offset         = 1.0        # m from center (width / 2)
+thruster_rotation_speed = 120.0      # deg/s
+thruster_max_angle      = [-60.0, 60.0]   # degrees
+thruster_force          = 47.088     # N (g * M * 1.2)
