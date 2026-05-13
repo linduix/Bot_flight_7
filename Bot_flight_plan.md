@@ -23,6 +23,21 @@
 - After chain finishes, target holds at final waypoint until episode end at `T`.
 - Target interpolates linearly between waypoints based on chain timer.
 
+**Initial drone state randomization (per seed):**
+- angle ∈ ±15° uniform
+- angular_velocity ∈ ±0.5 rad/s uniform
+- velocity drawn from small isotropic ball (magnitude ≤ ~10% of drone max velocity)
+- position fixed at chosen spawn waypoint
+- t1_angle, t2_angle initialized to 0
+- Same initialization across all drones on a given seed (fairness)
+- Rationale: prevents the controller from overfitting to rest-upright-zero starts; forces it to learn recovery transients used at deployment and after curriculum transitions
+
+**Observation and dynamics noise:**
+- Added only after vanilla MAP-Elites is validated noise-free (do not introduce during initial debugging)
+- Observation noise: Gaussian, ~1–2% of per-input scale, applied to each observation channel independently per tick
+- No action noise or dynamics noise at this stage — revisit if sim-to-anything transfer becomes a goal
+- Rationale: cheap robustness insurance; eliminates policies that depend on knife-edge sensor precision
+
 **Drone state (complex array, length 6):**
 - position (complex: x + iy)
 - velocity (complex: vx + ivy)
@@ -87,7 +102,7 @@
 
 **Decision: Fixed feedforward MLP, no recurrence**
 
-- Architecture: feedforward MLP, 14-16-16-4 (~512 parameters). Under 1000 parameter constraint satisfied.
+- Architecture: feedforward MLP, 14-12-9-6-5-4 (32 hidden nodes, ~319 weights). Pyramid narrowing informed by prior NEAT run (depth-preferring with progressive narrowing). Under 1000 parameter constraint satisfied.
 - No recurrent connections — current kinematic state is fully observable, feedforward is sufficient
 - Double-stacked inputs replace recurrence for finite memory — current and previous timestep of all sensor inputs concatenated into one flat observation vector
 - If gait phase ambiguity emerges in practice, add previous timestep stack as additional inputs

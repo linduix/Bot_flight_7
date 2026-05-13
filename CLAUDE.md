@@ -35,8 +35,8 @@ Do not skip steps or reorder — each stage validates the components needed by t
 ### Three-Layer Separation (must remain clean for MOEA/D swappability)
 
 ```
-Evaluation Layer  →  takes weight vector, runs simulation, returns {fitness, descriptors, raw stats}
-Individual Layer  →  wraps weight vector + last evaluation results (shared across algorithms)
+Evaluation Layer  →  takes genome (weights + biases), runs simulation, returns {fitness, descriptors, raw stats}
+Individual Layer  →  wraps genome + last evaluation results (shared across algorithms)
 Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without touching other layers)
 ```
 
@@ -48,6 +48,8 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 - **Spawn (per seed):** one of the 5 waypoints chosen uniformly. Same spawn for all drones on that seed (fairness).
 - **Touch trigger:** drone within `touch_radius` of target → chain movement begins. One-way (cannot un-trigger). Not scored — only gates chain.
 - **Chain motion:** linear interpolation between waypoints based on post-touch timer. Holds at final waypoint until `T`.
+- **Initial drone state (per seed, randomized):** angle ∈ ±15° uniform, angular_velocity ∈ ±0.5 rad/s uniform, velocity in small isotropic ball (≤ ~10% of max), position at spawn waypoint, t1/t2 angles zero. Same init for all drones on that seed (fairness). Prevents overfit to rest-upright starts and forces learned recovery transients.
+- **Noise:** observation noise (Gaussian, ~1–2% of per-input scale, per channel per tick) added only after vanilla MAP-Elites validates noise-free. No action/dynamics noise at this stage.
 - **Drone state (complex array, length 6):** position (x+iy), velocity (vx+ivy), angle, angular_velocity, t1_angle, t2_angle. Last 4 stored as complex with zero imag for uniform dtype.
 - **Action (MLP outputs, 4 floats):** t1_target_angle, t2_target_angle (thrusters slew toward these at rotation-speed limit), t1_thrust, t2_thrust (0–1, applied immediately, not stored).
 - **Fitness per tick:** `dt / (1 + distance_to_target)`. Multiplied by 0.01 pre-touch.
@@ -56,19 +58,18 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 
 ### Network (Controller)
 
-- **Topology:** Fixed feedforward MLP, `14-16-16-4` (~512 params, under 1000-parameter constraint)
-- **Inputs (14 total):**
+- **Topology:** Fixed feedforward MLP, `13-12-9-6-5-4` (32 hidden nodes, ~404 params, under 1000-parameter constraint). Pyramid narrowing informed by prior NEAT run.
+- **Inputs (13 total):**
   - delta_position_now (2, body frame)
   - delta_position_prev (2, body frame) — only history, lets network infer target motion
   - velocity (2, body frame)
   - sin(angle), cos(angle) (2, world frame, gravity reference)
   - angular_velocity (1)
   - t1_angle, t2_angle (2, body frame, raw radians — clamped ±60° so no wrap)
-  - bias (1)
 - **Frame split:** angle world-frame (gravity reference); delta_position and velocity body-frame (rotation-invariant policy). Convert world→body via `value * exp(-1j * angle)`.
 - **Outputs:** thruster_angles(2) + thrust_magnitudes(2) = 4 continuous outputs
-- **Genome:** flat `float32` vector of all weights, direct encoding (no CPPN, no delta encoding)
-- **Bias:** handled as a bias node in the input layer, not as a separate learned parameter
+- **Genome:** flat `float32` vector of all weights and per-node biases concatenated, direct encoding (no CPPN, no delta encoding). Bias vector length = 36 (one per non-input node).
+- **Bias:** per-node scalar bias on every hidden and output node, stored as a separate bias vector in the genome alongside the weight matrices
 
 ### MAP-Elites Archive
 
