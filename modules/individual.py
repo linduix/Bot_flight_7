@@ -5,6 +5,7 @@ import numpy as np
 class Individual:
     tag:         str
     weights:     np.ndarray
+    biases:      np.ndarray
     fitness:     float|None = None
     descriptors: tuple|None = None
     stats:       list|None  = None

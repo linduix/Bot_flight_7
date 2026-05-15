@@ -58,8 +58,8 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 
 ### Network (Controller)
 
-- **Topology:** Fixed feedforward MLP, `13-12-9-6-5-4` (32 hidden nodes, ~404 params, under 1000-parameter constraint). Pyramid narrowing informed by prior NEAT run.
-- **Inputs (13 total):**
+- **Topology:** Fixed feedforward MLP, `11-12-9-6-5-4` (32 hidden nodes, ~380 params, under 1000-parameter constraint). Pyramid narrowing informed by prior NEAT run.
+- **Inputs (11 total):**
   - delta_position_now (2, body frame)
   - delta_position_prev (2, body frame) — only history, lets network infer target motion
   - velocity (2, body frame)

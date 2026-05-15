@@ -1,5 +1,5 @@
 [network]
-layers = [14, 12, 9, 6, 5, 4]
+layers = [11, 11, 9, 7, 5, 4]
 hidden_activation = "leaky_relu"
 output_activation = "tanh"
 
@@ -15,5 +15,5 @@ gravity         = -9.81      # m/s^2, y axis
 
 thruster_offset         = 1.0        # m from center (width / 2)
 thruster_rotation_speed = 120.0      # deg/s
-thruster_max_angle      = [-60.0, 60.0]   # degrees
+thruster_max_angle      = 20          # degrees
 thruster_force          = 47.088     # N (g * M * 1.2)
