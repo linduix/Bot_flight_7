@@ -7,5 +7,5 @@ class Individual:
     weights:     np.ndarray
     biases:      np.ndarray
     fitness:     float|None = None
-    descriptors: tuple|None = None
+    descriptors: dict|None = None
     stats:       list|None  = None

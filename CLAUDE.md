@@ -45,13 +45,13 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 - **Implementation:** Custom 2D physics, batched JAX (`jit` + `vmap` + `lax.scan`)
 - **Target chain (per seed):** 5 waypoints, first at (0,0). Remaining 4 at random angles + random distances normalized to sum to fixed `total_chain_length`.
 - **Segment times (per seed):** 4 random durations normalized to sum to 80% of episode time `T`. Remaining 20% is the approach phase before touch.
-- **Spawn (per seed):** one of the 5 waypoints chosen uniformly. Same spawn for all drones on that seed (fairness).
+- **Spawn (per seed):** always at origin (waypoint 0). Geometric variety comes from chain direction randomization, not spawn-location randomization. Same spawn for all drones on that seed (fairness).
 - **Touch trigger:** drone within `touch_radius` of target → chain movement begins. One-way (cannot un-trigger). Not scored — only gates chain.
 - **Chain motion:** linear interpolation between waypoints based on post-touch timer. Holds at final waypoint until `T`.
-- **Initial drone state (per seed, randomized):** angle ∈ ±15° uniform, angular_velocity ∈ ±0.5 rad/s uniform, velocity in small isotropic ball (≤ ~10% of max), position at spawn waypoint, t1/t2 angles zero. Same init for all drones on that seed (fairness). Prevents overfit to rest-upright starts and forces learned recovery transients.
+- **Initial drone state (per seed, randomized):** angle ∈ ±15° uniform, angular_velocity ∈ ±0.5 rad/s uniform, velocity in small isotropic ball (≤ ~10% of max), position at origin, t1/t2 angles zero. Same init for all drones on that seed (fairness). Prevents overfit to rest-upright starts and forces learned recovery transients.
 - **Noise:** observation noise (Gaussian, ~1–2% of per-input scale, per channel per tick) added only after vanilla MAP-Elites validates noise-free. No action/dynamics noise at this stage.
 - **Drone state (complex array, length 6):** position (x+iy), velocity (vx+ivy), angle, angular_velocity, t1_angle, t2_angle. Last 4 stored as complex with zero imag for uniform dtype.
-- **Action (MLP outputs, 4 floats):** t1_target_angle, t2_target_angle (thrusters slew toward these at rotation-speed limit), t1_thrust, t2_thrust (0–1, applied immediately, not stored).
+- **Action (MLP outputs, 4 floats):** t1_thrust, t2_thrust (clipped to ≥0, applied immediately), t1_rot_rate, t2_rot_rate (∈ [-1, +1], gimbal rotates at `rotation_speed * rate` per tick; gimbal angle clipped to ±60°). Rate-command gimbal control, not position-command — network must output zero to hold a gimbal angle.
 - **Fitness per tick:** `dt / (1 + distance_to_target)`. Multiplied by 0.01 pre-touch.
 - **Episode fitness:** sum over all ticks. **Drone fitness:** mean across all S seeds.
 - **Batching:** P drones × S seeds flattened to P×S parallel episodes. Chains pre-generated in NumPy, passed as static arrays. `lax.scan` over time, `vmap` over episodes.
