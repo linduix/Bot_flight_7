@@ -3,12 +3,12 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 
 from modules.individual import Individual
 from modules.batch_brain import brain
-from modules.simulation.sim1 import physics_update, get_drone_conf, config_path
+from modules.simulation.sim1 import physics_update, get_drone_conf, config_path, gen_target_chain
 import numpy as np
 import pygame as pg
 
 
-METERS_TO_PIXELS = 20
+METERS_TO_PIXELS = 12
 SCREEN_W = 1280
 SCREEN_H = 720
 
@@ -150,7 +150,8 @@ def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, dr
                 pool.spawn(t2pos, vel, start_alpha=255 * t2_thrust)
 
 
-def run_visual(individuals: list[Individual]):
+def run_visual(individuals: list[Individual], settings: dict | None = None, seed=None):
+    settings = settings or {'length': 50, 'limit': 10}
     pg.init()
     screen = pg.display.set_mode((SCREEN_W, SCREEN_H))
     pg.display.set_caption("Sim1 Visual")
@@ -164,13 +165,34 @@ def run_visual(individuals: list[Individual]):
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
 
-    state_matrix  = np.zeros((n, 6), dtype=complex)
+    dt = 1 / 60
+
+    speed_factor = 5
+    # generated target chain (same logic as headless sim)
+    rng = np.random.default_rng(seed)
+    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt/speed_factor, rng)
+
+    # randomized init, identical across drones (fairness)
+    angle0   = rng.uniform(-np.deg2rad(90), np.deg2rad(90))
+    ang_vel0 = rng.uniform(-2, 2)
+    v_init_max = 5
+    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
+    v_dir    = rng.uniform(-np.pi, np.pi)
+    vel0     = v_mag * np.exp(1j * v_dir)
+
+    state_matrix = np.zeros((n, 6), dtype=complex)
+    state_matrix[:, 0] = 0j
+    state_matrix[:, 1] = vel0
+    state_matrix[:, 2] = angle0
+    state_matrix[:, 3] = ang_vel0
+
     action_matrix = np.zeros((n, 4), dtype=float)
 
-    target = np.zeros(n, dtype=complex)
+    # simulation state arrays
+    toggle = np.zeros(n, dtype=bool)
+    ticks  = np.zeros(n, dtype=int)
     particles = ParticlePool(max_particles=4000)
-
-    dt = 1 / 60
+    prev_delta = None
 
     while True:
         for event in pg.event.get():
@@ -178,17 +200,39 @@ def run_visual(individuals: list[Individual]):
                 pg.quit()
                 return
 
-        # mouse position → world space
-        mx, my = pg.mouse.get_pos()
-        wx = (mx - SCREEN_W / 2) / METERS_TO_PIXELS
-        wy = (SCREEN_H / 2 - my) / METERS_TO_PIXELS
-        target[:] = wx + 1j * wy
+        # per-drone target from generated chain (clamp to last tick)
+        idx = np.minimum(ticks, len(tick_pos) - 1)
+        target = tick_pos[idx]
 
-        # observations (zeros for now — wire up properly when obs are ready)
-        obs = np.zeros((n, 11, 1))
+        # MAKE OBSERVATION ARRAY
+        delta_world = target - state_matrix[:, 0]
+        delta = delta_world * np.exp(-1j * state_matrix[:, 2].real)
+        if prev_delta is None:
+            prev_delta = delta.copy()
+        vel     = state_matrix[:, 1] * np.exp(-1j * state_matrix[:, 2].real)
+        angle   = state_matrix[:, 2].real
+        ang_vel = state_matrix[:, 3].real
+        t1_ang  = state_matrix[:, 4].real
+        t2_ang  = state_matrix[:, 5].real
+
+        obs = np.column_stack([
+            delta.real, delta.imag,
+            prev_delta.real, prev_delta.imag,
+            vel.real, vel.imag,
+            np.sin(angle), np.cos(angle),
+            ang_vel,
+            t1_ang, t2_ang
+        ])[:, :, np.newaxis]
+
+        prev_delta = delta.copy()
+
         action_matrix = Brain.forward(obs)[:, :, 0]
 
-        speed_factor = 5
+        # progress chain: touched drones advance ticks
+        dist = np.abs(delta_world)
+        toggle |= dist < 0.5
+        ticks += toggle
+
         state_matrix = physics_update(dt/speed_factor, state_matrix, action_matrix, drone_conf)
         spawn_thruster_particles(particles, state_matrix, action_matrix, drone_conf, n)
         particles.update(dt/speed_factor)
@@ -197,9 +241,17 @@ def run_visual(individuals: list[Individual]):
 
         particles.draw(screen)
 
-        # draw target
-        tx, ty = world_to_screen(target[0])
-        pg.draw.circle(screen, (100, 230, 100), (tx, ty), 5)
+        # draw origin -> wp1 (red, non-moving spawn-to-target leg)
+        pg.draw.line(screen, (200, 60, 60),
+                     world_to_screen(0j), world_to_screen(tick_pos[0]), 1)
+
+        # draw chain path (faint) + every drone's current target
+        path_pts = [world_to_screen(p) for p in tick_pos[::max(1, len(tick_pos)//200)]]
+        if len(path_pts) > 1:
+            pg.draw.lines(screen, (60, 100, 60), False, path_pts, 1)
+        for i in range(n):
+            tx, ty = world_to_screen(target[i])
+            pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
         for i in range(n):
             draw_drone(screen, state_matrix[i], drone_surf, thruster_surf, drone_conf, alpha=180)
