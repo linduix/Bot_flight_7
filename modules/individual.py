@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 @dataclass
@@ -7,5 +7,5 @@ class Individual:
     weights:     np.ndarray
     biases:      np.ndarray
     fitness:     float|None = None
-    descriptors: dict       = {}
+    descriptors: dict       = field(default_factory=dict)
     stats:       list|None  = None

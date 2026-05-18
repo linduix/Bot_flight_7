@@ -273,10 +273,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     for i, ind in enumerate(individuals):
         ind.fitness = fitness[i]
         ind.descriptors = {'ang_vel': mean_av[i], 'saturation': mean_sat[i]}
-    
-    print(fitness.max())
 
-    return {}
+    return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}
 
 if __name__=="__main__":
     import time

@@ -1,5 +1,6 @@
 from modules.individual import Individual
 from modules.evo_alg import arms
+from typing import Callable
 import numpy as np
 
 class MAB():
@@ -61,13 +62,28 @@ class algorithm():
         self.xrange = (0, 10)
         self.yrange = (0, 1)
         
-        self.arms: dict['str', object] = {'random': arms.random}
+        self.arms: dict['str', Callable] = {
+            'random': arms.random,
+            'gaussian': arms.gaussian
+        }
         self.bandit = MAB(list(self.arms.keys()))
 
-    def propose(self, qty, Mpool=None) -> tuple[ list[Individual], dict[str, str|int|float] ]:
-        budget = self.bandit.pull(qty)
-        proposition = []
+    def propose(self, qty, Mpool=None) -> tuple[ list[Individual], dict ]:
+        # initial bootsrap
+        if self.gen == 0:
+            proposition: list[Individual] = self.arms['random'](None, None, qty)
+            return proposition, {'budget': {'random': qty}}
 
+        # get the arm budget
+        budget = self.bandit.pull(qty)
+        proposition: list[Individual] = []
+
+        # for each arm add its budgeted propositions
+        for arm, budg in budget.items():
+            indvs = self.arms[arm](self.archive_indv, self.archive_fit, budg)
+            proposition.extend(indvs)
+
+        return proposition, {'budget': dict(budget)}
 
 
     def update(self, individuals: list[Individual]):
@@ -88,19 +104,37 @@ class algorithm():
                 stats['updates'] += 1
             else:
                 continue
-            
+
             # update the archives
             self.archive_fit[idx, idy]  = i.fitness
             self.archive_indv[idx, idy] = i
             bandit_score[i.tag] += 1
 
-        # increment gen
-        self.gen += 1
         # update the bandit
-        self.bandit.update_stats(bandit_score)
+        if self.gen > 0:
+            self.bandit.update_stats(bandit_score)
         if self.gen > 99:
             self.bandit.decay = 0.99
+
+        # smoke-test diagnostics: is the archive actually filling?
+        occupied = self.archive_fit > -np.inf
+        stats['coverage']     = int(occupied.sum()) / (self.res * self.res)
+        stats['archive_best'] = float(self.archive_fit[occupied].max()) if occupied.any() else None
+
+        # increment gen
+        self.gen += 1
         return stats
 
     def revalidate(self, individual):
         pass
+
+if __name__ == "__main__":
+    from modules.simulation import sim1
+    alg = algorithm(50)
+    for i in range(10000):
+        indv, propstat = alg.propose(1000)
+        simstat        = sim1.sim(indv, {'limit': 10, 'length': 10}, seed=42)
+        updatestat     = alg.update(indv)
+        print(f"gen {i}:\n\t budget={propstat['budget']}\n\t fit_mean={simstat['fit_mean']:.3f} fit_max={simstat['fit_max']:.3f}\n\t updates={updatestat['updates']}\n\t coverage={updatestat['coverage']:.2f} archive_best={updatestat['archive_best']:.3f}\n\t bandit_score={updatestat['bandit_score']}")
+
+    
