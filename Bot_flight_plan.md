@@ -126,9 +126,9 @@
 
 **Primary axes (2D archive):**
 
-1. **Predictive error ratio** — mean(distance from drone to cursor position k steps ahead) / mean(distance from drone to cursor current position), computed on moving-cursor segments only. Values below 1.0 indicate anticipatory behavior (drone is closer to where the cursor is going than where it currently is). Values above 1.0 indicate reactive/lagging behavior. k lookahead horizon to be calibrated empirically once simulation exists — should correspond roughly to the drone's mechanical response time.
+1. **Mean absolute angular velocity** — `mean(|ang_vel|)` across all ticks in the episode (rad/s). Low values indicate a stable, upright posture with minimal body rotation. High values indicate aggressive spinning / rapid attitude changes. Bounds: `[0, 10]` rad/s with the top bin reserved as an overflow catch-all for anything `≥ 10`. To be re-calibrated after first batch.
 
-2. **Overshoot ratio** — at each cursor direction change in evaluation trajectories, measure max distance the drone travels past the cursor's new trajectory line, divided by the initial tracking error at the moment of direction change. Averaged across all transient events in all evaluation runs. Value of zero means monotonic approach (never flies past target). High values indicate the controller consistently overshoots and corrects back. Requires a fitness floor — non-tracking controllers that never reach the target are excluded from descriptor computation and binned separately.
+2. **Mean thrust saturation** — fraction of ticks where the dominant thruster output exceeds 0.9 (i.e. `mean(max(t1, t2) > 0.9)`). Strictly in `[0, 1]` by construction. Low values indicate gentle, modulated control. High values indicate bang-bang / saturated control.
 
 **Tertiary axis (for 3D archive expansion later):**
 
@@ -323,6 +323,6 @@ Closest published analogues: PGA-MAP-Elites + QDax multi-emitter architecture + 
 
 2. **Curriculum stage definitions** — specific spawn difficulty levels and transition criteria not yet defined.
 
-3. **Predictive error ratio k value** — lookahead horizon must be calibrated empirically against drone mechanical response time once simulation is built.
+3. **Angular velocity descriptor upper bound** — needs empirical calibration after first batch (thrust saturation axis is already `[0, 1]` by construction).
 
 4. **Evaluation trajectory design** — standardized cursor trajectories for evaluation not yet defined. Candidates: straight line, figure-eight, sharp reversal, slow curve, stationary hover. Descriptor validity depends on consistent evaluation conditions across all candidates.

@@ -74,8 +74,8 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 ### MAP-Elites Archive
 
 - **2D behavioral descriptor grid:**
-  1. **Predictive error ratio** — mean dist to cursor k steps ahead / mean dist to cursor now (k calibrated empirically once simulation exists)
-  2. **Overshoot ratio** — max overshoot past new trajectory / initial tracking error at direction change, averaged over all transient events
+  1. **Mean absolute angular velocity** — `mean(|ang_vel|)` across all ticks (rad/s). Low = stable posture, high = aggressive spinning. Bounds: `[0, 10]` rad/s with the top bin acting as an overflow catch-all for anything ≥ 10. Calibrate after first batch.
+  2. **Mean thrust saturation** — fraction of ticks where `max(t1, t2) > 0.9`. Strictly in `[0, 1]` by construction. Low = gentle control, high = bang-bang control.
 - **Tertiary axis** (future 3D expansion): mean absolute body angle across episode
 - **Replacement rule:** neutral drift — new candidate replaces occupant if fitness ≥ current occupant
 - **Grid resolution:** TBD after empirical calibration of descriptor ranges
@@ -134,6 +134,6 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 ## Open Items (resolve before implementing the archive)
 
 - Archive grid resolution (requires empirical descriptor range calibration from simulation)
+- Angular velocity descriptor upper bound (calibrate empirically; saturation axis is already `[0, 1]`)
 - Curriculum stage definitions (difficulty levels and transition criteria)
-- Predictive error ratio lookahead `k` (calibrate against drone mechanical response time)
 - Standardized evaluation trajectory set (straight line, figure-eight, sharp reversal, slow curve, hover)
