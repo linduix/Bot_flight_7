@@ -2,6 +2,17 @@ from modules.individual import Individual
 from modules.evo_alg import arms
 import numpy as np
 
+class MAB():
+    def __init__(self, arms: list[str]) -> None:
+        self.total_pulls = 0
+        self.arms = {}
+        for k in arms:
+            self.arms[k] = {'pulls': 0, 'score': 0}
+
+    def pull(self, qty):
+        pass
+
+
 class algorithm():
     def __init__(self, resolution) -> None:
         self.res = resolution
