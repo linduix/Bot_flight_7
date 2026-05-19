@@ -47,8 +47,9 @@ def gaussian(archive_indv, archive_fit, qty) -> list[Individual]:
 
     return(children)
 
-def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty):
+def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individual]:
     rng = np.random.default_rng()
+    children = []
 
     # calculate weights
     w  = np.maximum(archive_fit, 0)
@@ -63,17 +64,29 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty):
 
     for row, col in zip(pa_r, pa_c):
         # get parent a
-        pa   = archive_indv[row, col]
-        # get the distances from
+        pa: Individual = archive_indv[row, col]
+        # get the distances from parent a
         diff = occupied - np.array([row, col])
         dist = np.linalg.norm(diff, axis=1)
         self_mask = dist == 0
 
+        # weight the rest by distance, closer is better
         b_weights = 1 / (1 + dist ** 2)
         b_weights[self_mask] = 0
         assert(b_weights.sum() > 0)
         b_probs   = b_weights / b_weights.sum()
 
+        # get parent b
         chosen_idx = rng.choice(b_probs.size, p=b_probs)
         pb_r, pb_c = occupied[chosen_idx]
-        pb         = archive_indv[pb_r, pb_c]
+        pb: Individual = archive_indv[pb_r, pb_c]
+
+        # child weight = pa weight + noise + lerp between parent a and b
+        size = pa.weights.size
+        noise_strength = 0.15
+        noise = rng.standard_normal(size=size) * noise_strength
+        child = pa.weights + noise + (pb.weights - pa.weights) * rng.standard_normal(size=size)
+
+        children.append(child)
+
+    return children
