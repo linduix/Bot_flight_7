@@ -182,3 +182,4 @@ cython_debug/
 
 .claude/worktrees/*
 botfligt6(old)/
+archive_heatmap.png

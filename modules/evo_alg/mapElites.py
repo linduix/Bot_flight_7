@@ -50,7 +50,6 @@ class MAB():
 
         return budget
 
-
 class algorithm():
     def __init__(self, resolution) -> None:
         self.gen = 0
@@ -63,8 +62,9 @@ class algorithm():
         self.yrange = (0, 1)
 
         self.arms: dict['str', Callable] = {
-            'random': arms.random,
-            'gaussian': arms.gaussian
+            'random'  : arms.random,
+            'gaussian': arms.gaussian,
+            'iso'     : arms.iso
         }
         self.bandit = MAB(list(self.arms.keys()))
 

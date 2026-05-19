@@ -71,7 +71,7 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individu
         self_mask = dist == 0
 
         # weight the rest by distance, closer is better
-        b_weights = 1 / (1 + dist ** 2)
+        b_weights = 1 / (1 + dist ** 1.2)
         b_weights[self_mask] = 0
         assert(b_weights.sum() > 0)
         b_probs   = b_weights / b_weights.sum()
@@ -82,10 +82,17 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individu
         pb: Individual = archive_indv[pb_r, pb_c]
 
         # child weight = pa weight + noise + lerp between parent a and b
-        size = pa.weights.size
-        noise_strength = 0.15
-        noise = rng.standard_normal(size=size) * noise_strength
-        child = pa.weights + noise + (pb.weights - pa.weights) * rng.standard_normal(size=size)
+        noise_strength = 0.05
+        lerp_strength = 0.1
+        t = rng.standard_normal()
+        w_noise = rng.standard_normal(size=pa.weights.size) * noise_strength
+        b_noise = rng.standard_normal(size=pa.biases.size ) * noise_strength
+
+        # comence lerping
+        child_w = pa.weights + w_noise + (pb.weights - pa.weights) * t * lerp_strength
+        child_b = pa.biases  + b_noise + (pb.biases  - pa.biases ) * t * lerp_strength
+
+        child = Individual(tag='iso', weights=child_w, biases=child_b)
 
         children.append(child)
 
