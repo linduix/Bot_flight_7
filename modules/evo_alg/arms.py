@@ -1,9 +1,12 @@
-from matplotlib import colormaps
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from modules.evo_alg.mapElites import Archive
+
 from modules.individual import Individual
 import numpy as np
 import tomllib
 
-def random(archive_indv, archive_fit, qty) -> list[Individual]:
+def random(archive: Archive, qty) -> list[Individual]:
     children = []
 
     with open('config.toml', 'rb') as f:
@@ -20,51 +23,54 @@ def random(archive_indv, archive_fit, qty) -> list[Individual]:
         weights = np.random.randn(total_weights).astype(np.float32)
         biases  = np.random.randn(total_biases ).astype(np.float32)
 
-        child   = Individual(weights=weights, biases=biases, tag='random')
+        child   = Individual('random', weights=weights, biases=biases, parent_idx=None)
         children.append(child)
 
     return children
 
-def gaussian(archive_indv, archive_fit, qty) -> list[Individual]:
+def gaussian(archive: Archive, qty) -> list[Individual]:
     std = 0.1
-
     rng = np.random.default_rng()
-    # returns list of coordinates: eg 2d array; rows matches, columns coordinates x, y
-    occupied = np.argwhere(archive_fit > -np.inf)
+
+    # weight by curiosity (for exploration)
+    w = np.where(archive.fit != -np.inf, archive.curi, 0) # 0 weight for empty cells
+    assert(w.sum() > 0)
+    probs = w.ravel() / w.sum()
 
     # randomly choose idx from occupied coordinates
-    choices = rng.choice(len(occupied), size=qty)
-    children = []
-    for c in choices:
-        # get the coord pair from the idx
-        i, j = occupied[c]
+    choices = rng.choice(len(probs), size=qty, p=probs)
+    row, col = np.unravel_index(choices, shape=w.shape)
 
-        indv: Individual = archive_indv[i, j]
+    children = []
+    for i, j in zip(row, col):
+        indv: Individual = archive.get(i, j)
+        # mutate weights
         weights = indv.weights + rng.standard_normal(size=indv.weights.size) * std
         biases  = indv.biases  + rng.standard_normal(size=indv.biases.size ) * std
-        child   = Individual('gaussian', weights=weights, biases=biases)
+        # make child
+        child   = Individual('gaussian', weights=weights, biases=biases, parent_idx=(i, j))
         children.append(child)
 
     return(children)
 
-def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individual]:
+def iso(archive: Archive, qty) -> list[Individual]:
     rng = np.random.default_rng()
     children = []
 
-    # calculate weights
-    w  = np.maximum(archive_fit, 0)
+    # calculate weights by improvement (for exploitation)
+    w = np.where(archive.fit != -np.inf, archive.impr, 0) # 0 weight for empty cell
     assert(w.sum() > 0)
-    probs = w.ravel() / w.sum()     # flatened matrix
+    probs = w.ravel() / w.sum() # flatened matrix
 
     chosen_idx = rng.choice(probs.size, size=qty, p=probs)   # choose idx based on weight
     pa_r, pa_c = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coords
 
     # get coords of all occupied
-    occupied = np.argwhere(archive_fit > -np.inf)
+    occupied = np.argwhere(archive.fit > -np.inf)
 
     for row, col in zip(pa_r, pa_c):
         # get parent a
-        pa: Individual = archive_indv[row, col]
+        pa: Individual = archive.get(row, col)
         # get the distances from parent a
         diff = occupied - np.array([row, col])
         dist = np.linalg.norm(diff, axis=1)
@@ -79,7 +85,7 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individu
         # get parent b
         chosen_idx = rng.choice(b_probs.size, p=b_probs)
         pb_r, pb_c = occupied[chosen_idx]
-        pb: Individual = archive_indv[pb_r, pb_c]
+        pb: Individual = archive.get(pb_r, pb_c)
 
         # child weight = pa weight + noise + lerp between parent a and b
         noise_strength = 0.05
@@ -92,7 +98,7 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty) -> list[Individu
         child_w = pa.weights + w_noise + (pb.weights - pa.weights) * t * lerp_strength
         child_b = pa.biases  + b_noise + (pb.biases  - pa.biases ) * t * lerp_strength
 
-        child = Individual(tag='iso', weights=child_w, biases=child_b)
+        child = Individual('iso', weights=child_w, biases=child_b, parent_idx=(row, col))
 
         children.append(child)
 

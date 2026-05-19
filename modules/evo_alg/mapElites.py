@@ -1,6 +1,6 @@
 from modules.individual import Individual
 from modules.evo_alg import arms
-from typing import Callable
+from typing import Callable, cast
 import numpy as np
 
 class MAB():
@@ -30,7 +30,7 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(2 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(1 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value
@@ -50,18 +50,38 @@ class MAB():
 
         return budget
 
+class Archive():
+    def __init__(self, res) -> None:
+        # descriptor minmax; mean ang vel 0-3+, thrust saturation 0-1
+        self.xrange: tuple = (0, 3)
+        self.yrange: tuple = (0, 1)
+
+        self.res  = res
+        self.indv: np.ndarray = np.empty((res, res), dtype=object) # matrix of Individuals
+        self.fit : np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
+        self.curi: np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
+        self.impr: np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
+
+    def coordinates(self, i: Individual) -> tuple[int, int]:
+        # calculate the archive coordinates for individual
+        xval, yval = i.descriptors['ang_vel'], i.descriptors['saturation']
+        idx = int(((xval - self.xrange[0]) / (self.xrange[1] - self.xrange[0])) * self.res)
+        idx = np.clip(idx, 0, self.res - 1) # keep index in bounds
+
+        idy = int(((yval - self.yrange[0]) / (self.yrange[1] - self.yrange[0])) * self.res)
+        idy = np.clip(idy, 0, self.res - 1) # keep index in bounds
+
+        return idx, idy
+    
+    def get(self, row, col) -> Individual:
+        return cast(Individual, self.indv[row, col])
+
 class algorithm():
     def __init__(self, resolution) -> None:
         self.gen = 0
-        self.res = resolution
+        self.archive = Archive(resolution)
 
-        self.archive_indv = np.empty((self.res, self.res), dtype=object)
-        self.archive_fit  = np.full((self.res, self.res), -np.inf)
-        # descriptor minmax; mean ang vel 0-3+, thrust saturation 0-1
-        self.xrange = (0, 3)
-        self.yrange = (0, 1)
-
-        self.arms: dict['str', Callable] = {
+        self.arms: dict['str', Callable[[Archive, int], list[Individual]]] = {
             'random'  : arms.random,
             'gaussian': arms.gaussian,
             'iso'     : arms.iso
@@ -70,8 +90,9 @@ class algorithm():
 
     def propose(self, qty, Mpool=None) -> tuple[ list[Individual], dict ]:
         # initial bootsrap
+        self.batch_size = qty
         if self.gen == 0:
-            proposition: list[Individual] = self.arms['random'](None, None, qty)
+            proposition: list[Individual] = self.arms['random'](self.archive, qty)
             return proposition, {'budget': {'random': qty}}
 
         # get the arm budget
@@ -80,7 +101,7 @@ class algorithm():
 
         # for each arm add its budgeted propositions
         for arm, budg in budget.items():
-            indvs = self.arms[arm](self.archive_indv, self.archive_fit, budg)
+            indvs = self.arms[arm](self.archive, budg)
             proposition.extend(indvs)
 
         return proposition, {'budget': dict(budget)}
@@ -88,26 +109,30 @@ class algorithm():
 
     def update(self, individuals: list[Individual]):
         bandit_score = {k: 0.0 for k in self.arms.keys()}
+        curi_decay = 0.01 ** (1/self.batch_size) # curiosity decay factor
 
         stats = {'updates': 0, 'bandit_score': bandit_score}
         for i in individuals:
-            # calculate the archive coordinates for individual
-            xval, yval = i.descriptors['ang_vel'], i.descriptors['saturation']
-            idx = int(((xval - self.xrange[0]) / (self.xrange[1] - self.xrange[0])) * self.res)
-            idx = np.clip(idx, 0, self.res - 1) # keep index in bounds
-
-            idy = int(((yval - self.yrange[0]) / (self.yrange[1] - self.yrange[0])) * self.res)
-            idy = np.clip(idy, 0, self.res - 1) # keep index in bounds
+            idx, idy = self.archive.coordinates(i)
 
             # if slot empty fill it and reward bandit:
-            if i.fitness >= self.archive_fit[idx, idy]:
+            old_fit = self.archive.fit[idx, idy]
+            if i.fitness >= old_fit:
                 stats['updates'] += 1
             else:
+                if i.parent_idx is None:
+                    continue
+                self.archive.curi[i.parent_idx] = max(self.archive.curi[i.parent_idx] * 0.99, 0.01)
                 continue
 
             # update the archives
-            self.archive_fit[idx, idy]  = i.fitness
-            self.archive_indv[idx, idy] = i
+            self.archive.fit[idx, idy]  =  i.fitness
+            self.archive.indv[idx, idy] =  i
+            if i.parent_idx is not None:
+                self.archive.curi[i.parent_idx] += 1
+            if old_fit != -np.inf:
+                self.archive.impr[idx, idy] += i.fitness - old_fit
+
             bandit_score[i.tag] += 1
 
         # update the bandit
@@ -116,10 +141,14 @@ class algorithm():
         if self.gen > 99:
             self.bandit.decay = 0.99
 
+        # decay improvement matrix
+        self.archive.impr *= 0.95
+        self.archive.impr = np.maximum(0.01, self.archive.impr)
+
         # smoke-test diagnostics: is the archive actually filling?
-        occupied = self.archive_fit > -np.inf
-        stats['coverage']     = int(occupied.sum()) / (self.res * self.res)
-        stats['archive_best'] = float(self.archive_fit[occupied].max()) if occupied.any() else None
+        occupied = self.archive.fit > -np.inf
+        stats['coverage']     = int(occupied.sum()) / (self.archive.res * self.archive.res)
+        stats['archive_best'] = float(self.archive.fit[occupied].max()) if occupied.any() else None
 
         # increment gen
         self.gen += 1
@@ -131,62 +160,125 @@ class algorithm():
 if __name__ == "__main__":
     import time
     from modules.simulation import sim1
-    alg = algorithm(50)
 
-    max_seconds = 120
-    batch_size = 2000
-    start = time.time()
-    i = 0
-    trajectory = []  # (elapsed, archive_best, top10_mean) per gen
-    total_evals = 0
-    while time.time() - start < max_seconds:
-        indv, propstat = alg.propose(batch_size)
-        simstat        = sim1.sim(indv, {'limit': 10, 'length': 10}, seed=42)
-        updatestat     = alg.update(indv)
-        elapsed = time.time() - start
-        total_evals += batch_size
+    N_SEEDS     = 1
+    MAX_SECONDS = 60 * 5
+    BATCH_SIZE  = 2000
+    RESOLUTION  = 50
 
-        occ = alg.archive_fit[alg.archive_fit > -np.inf]
-        top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
-        trajectory.append((elapsed, updatestat['archive_best'], top10))
+    results = []
+    for k in range(N_SEEDS):
+        print(f"\n=== seed {k+1}/{N_SEEDS} ===", flush=True)
+        alg = algorithm(RESOLUTION)
 
-        print(f"gen {i} [{elapsed:.1f}s]:\n\t budget={propstat['budget']}\n\t fit_mean={simstat['fit_mean']:.3f} fit_max={simstat['fit_max']:.3f}\n\t updates={updatestat['updates']}\n\t coverage={updatestat['coverage']:.2f} archive_best={updatestat['archive_best']:.3f}\n\t bandit_score={updatestat['bandit_score']}")
-        i += 1
+        start = time.time()
+        gen_count = 0
+        trajectory = []
+        total_evals = 0
+        while time.time() - start < MAX_SECONDS:
+            indv, propstat = alg.propose(BATCH_SIZE)
+            simstat        = sim1.sim(indv, {'limit': 10, 'length': 40})
+            updatestat     = alg.update(indv)
+            elapsed = time.time() - start
+            total_evals += BATCH_SIZE
 
-    occupied = alg.archive_fit[alg.archive_fit > -np.inf]
-    times = np.array([t[0] for t in trajectory])
-    bests = np.array([t[1] for t in trajectory])
-    top10s = np.array([t[2] for t in trajectory])
+            occ = alg.archive.fit[alg.archive.fit > -np.inf]
+            top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
+            trajectory.append((elapsed, updatestat['archive_best'], top10))
+            gen_count += 1
 
-    # AUC of archive_best over time (variance-robust: integrates whole trajectory)
-    auc_best  = np.trapz(bests,  times) / times[-1]
-    auc_top10 = np.trapz(top10s, times) / times[-1]
+        times  = np.array([t[0] for t in trajectory])
+        bests  = np.array([t[1] for t in trajectory])
+        top10s = np.array([t[2] for t in trajectory])
 
-    # time-to-threshold (when did archive_best first cross X?)
-    def time_to(threshold):
-        idx = np.argmax(bests >= threshold)
-        return times[idx] if bests[idx] >= threshold else None
+        auc_best  = float(np.trapezoid(bests,  times) / times[-1])
+        auc_top10 = float(np.trapezoid(top10s, times) / times[-1])
 
-    print(f"\n--- batch_size={batch_size} comparison metrics ---")
-    print(f"  generations:     {i}")
-    print(f"  total evals:     {total_evals}")
-    print(f"  evals/sec:       {total_evals / times[-1]:.0f}")
-    print(f"  final top10:     {top10s[-1]:.3f}   (more stable than max)")
-    print(f"  AUC archive_best:{auc_best:.3f}     (time-avg best, integrates whole run)")
-    print(f"  AUC top10:       {auc_top10:.3f}     (time-avg top10, smoothest signal)")
+        time_to = {}
+        for thr in [2.0, 3.0, 4.0, 5.0]:
+            idx = np.argmax(bests >= thr)
+            time_to[thr] = float(times[idx]) if bests[idx] >= thr else None
+
+        total_pulls = sum(s['pulls'] for s in alg.bandit.arms.values())
+        total_score = sum(s['score'] for s in alg.bandit.arms.values())
+        arm_stats = {}
+        for arm, s in alg.bandit.arms.items():
+            arm_stats[arm] = {
+                'mean':  s['score']/s['pulls'] if s['pulls'] > 0 else 0.0,
+                'pull%': s['pulls']/total_pulls if total_pulls > 0 else 0.0,
+                'score%':s['score']/total_score if total_score > 0 else 0.0,
+            }
+
+        coverage = float((alg.archive.fit > -np.inf).sum()) / (alg.archive.res ** 2)
+
+        results.append({
+            'gens':        gen_count,
+            'final_top10': float(top10s[-1]),
+            'auc_best':    auc_best,
+            'auc_top10':   auc_top10,
+            'coverage':    coverage,
+            'time_to':     time_to,
+            'arms':        arm_stats,
+            'alg':         alg,
+        })
+        print(f"  top10={results[-1]['final_top10']:.3f}  AUC_top10={results[-1]['auc_top10']:.3f}  cov={coverage:.2f}  gens={gen_count}", flush=True)
+
+    # ---- summary stats across seeds ----
+    top10s = [r['final_top10'] for r in results]
+    aucs   = [r['auc_top10']   for r in results]
+    aucbs  = [r['auc_best']    for r in results]
+    covs   = [r['coverage']    for r in results]
+    gens   = [r['gens']        for r in results]
+
+    print(f"\n=== summary across {N_SEEDS} seeds ({MAX_SECONDS}s, batch={BATCH_SIZE}) ===")
+    print(f"  {'metric':<14} {'min':>7} {'median':>7} {'max':>7} {'mean':>7} {'std':>7}")
+    for name, vals in [('final_top10', top10s), ('AUC_top10', aucs), ('AUC_best', aucbs), ('coverage', covs), ('gens', gens)]:
+        a = np.array(vals, dtype=float)
+        print(f"  {name:<14} {a.min():>7.3f} {np.median(a):>7.3f} {a.max():>7.3f} {a.mean():>7.3f} {a.std():>7.3f}")
+
+    print(f"\n  threshold reach rate:")
     for thr in [2.0, 3.0, 4.0, 5.0]:
-        t = time_to(thr)
-        print(f"  time to fit>={thr}: {f'{t:.1f}s' if t is not None else 'not reached'}")
+        hit_times = [r['time_to'][thr] for r in results if r['time_to'][thr] is not None]
+        rate = len(hit_times) / N_SEEDS
+        if hit_times:
+            print(f"    fit>={thr}: {rate:.0%}  (median time {np.median(hit_times):.1f}s)")
+        else:
+            print(f"    fit>={thr}: {rate:.0%}  (never reached)")
+
+    print(f"\n  arm allocation (mean across seeds):")
+    print(f"    {'arm':<10} {'pull%':>7} {'score%':>7} {'mean':>7}")
+    for arm in results[0]['arms']:
+        pull_pct  = np.mean([r['arms'][arm]['pull%']  for r in results])
+        score_pct = np.mean([r['arms'][arm]['score%'] for r in results])
+        mean_sc   = np.mean([r['arms'][arm]['mean']   for r in results])
+        print(f"    {arm:<10} {pull_pct:>6.1%} {score_pct:>6.1%} {mean_sc:>7.3f}")
+
+    # ---- heatmap from the final seed run ----
+    alg = results[-1]['alg']
 
     import matplotlib.pyplot as plt
-    display = np.where(alg.archive_fit > -np.inf, alg.archive_fit, np.nan)
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(display.T, origin='lower', aspect='auto', cmap='viridis',
-                   extent=[alg.xrange[0], alg.xrange[1], alg.yrange[0], alg.yrange[1]])
-    plt.colorbar(im, ax=ax, label='fitness')
-    ax.set_xlabel('mean |angular velocity| (rad/s)')
-    ax.set_ylabel('mean thrust saturation')
-    ax.set_title(f'archive fitness — gen {alg.gen}')
+    occ_mask = alg.archive.fit > -np.inf
+    extent   = [alg.archive.xrange[0], alg.archive.xrange[1],
+                alg.archive.yrange[0], alg.archive.yrange[1]]
+
+    panels = [
+        ('fitness',       alg.archive.fit,          'viridis'),
+        ('log curiosity', alg.archive.curi,         'magma'),
+        ('improvement',   alg.archive.impr,         'plasma'),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+    axes = axes.flatten()
+    for ax, (label, data, cmap) in zip(axes, panels):
+        display = np.where(occ_mask, data, np.nan)
+        im = ax.imshow(display.T, origin='lower', aspect='auto', cmap=cmap, extent=extent) # type: ignore
+        ax.set_box_aspect(1)
+        plt.colorbar(im, ax=ax, label=label)
+        ax.set_xlabel('mean |angular velocity| (rad/s)')
+        ax.set_ylabel('mean thrust saturation')
+        ax.set_title(f'{label} — gen {alg.gen} (final seed)')
+    axes[3].axis('off')
+
     plt.tight_layout()
     plt.savefig('archive_heatmap.png', dpi=150)
     plt.show()
