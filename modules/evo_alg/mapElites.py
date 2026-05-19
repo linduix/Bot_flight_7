@@ -27,7 +27,7 @@ class MAB():
         for _, stats in self.arms.items():
             if stats['pulls'] == 0:
                 continue
-            
+
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
             exploration = np.sqrt(2 * np.log(self.total_pulls) / stats['pulls'])
@@ -43,7 +43,7 @@ class MAB():
             # get for arm with most value
             best = max(self.arms, key=lambda k: self.arms[k]['value'])
 
-            # increment the budget + pulls                        
+            # increment the budget + pulls
             budget[best]     += 1
             self.total_pulls += 1
             self.arms[best]['pulls'] += 1
@@ -58,10 +58,10 @@ class algorithm():
 
         self.archive_indv = np.empty((self.res, self.res), dtype=object)
         self.archive_fit  = np.full((self.res, self.res), -np.inf)
-        # descriptor minmax; mean ang vel 0-10+, thrust saturation 0-1
-        self.xrange = (0, 10)
+        # descriptor minmax; mean ang vel 0-3+, thrust saturation 0-1
+        self.xrange = (0, 3)
         self.yrange = (0, 1)
-        
+
         self.arms: dict['str', Callable] = {
             'random': arms.random,
             'gaussian': arms.gaussian
@@ -129,12 +129,64 @@ class algorithm():
         pass
 
 if __name__ == "__main__":
+    import time
     from modules.simulation import sim1
     alg = algorithm(50)
-    for i in range(10000):
-        indv, propstat = alg.propose(1000)
+
+    max_seconds = 120
+    batch_size = 2000
+    start = time.time()
+    i = 0
+    trajectory = []  # (elapsed, archive_best, top10_mean) per gen
+    total_evals = 0
+    while time.time() - start < max_seconds:
+        indv, propstat = alg.propose(batch_size)
         simstat        = sim1.sim(indv, {'limit': 10, 'length': 10}, seed=42)
         updatestat     = alg.update(indv)
-        print(f"gen {i}:\n\t budget={propstat['budget']}\n\t fit_mean={simstat['fit_mean']:.3f} fit_max={simstat['fit_max']:.3f}\n\t updates={updatestat['updates']}\n\t coverage={updatestat['coverage']:.2f} archive_best={updatestat['archive_best']:.3f}\n\t bandit_score={updatestat['bandit_score']}")
+        elapsed = time.time() - start
+        total_evals += batch_size
 
-    
+        occ = alg.archive_fit[alg.archive_fit > -np.inf]
+        top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
+        trajectory.append((elapsed, updatestat['archive_best'], top10))
+
+        print(f"gen {i} [{elapsed:.1f}s]:\n\t budget={propstat['budget']}\n\t fit_mean={simstat['fit_mean']:.3f} fit_max={simstat['fit_max']:.3f}\n\t updates={updatestat['updates']}\n\t coverage={updatestat['coverage']:.2f} archive_best={updatestat['archive_best']:.3f}\n\t bandit_score={updatestat['bandit_score']}")
+        i += 1
+
+    occupied = alg.archive_fit[alg.archive_fit > -np.inf]
+    times = np.array([t[0] for t in trajectory])
+    bests = np.array([t[1] for t in trajectory])
+    top10s = np.array([t[2] for t in trajectory])
+
+    # AUC of archive_best over time (variance-robust: integrates whole trajectory)
+    auc_best  = np.trapz(bests,  times) / times[-1]
+    auc_top10 = np.trapz(top10s, times) / times[-1]
+
+    # time-to-threshold (when did archive_best first cross X?)
+    def time_to(threshold):
+        idx = np.argmax(bests >= threshold)
+        return times[idx] if bests[idx] >= threshold else None
+
+    print(f"\n--- batch_size={batch_size} comparison metrics ---")
+    print(f"  generations:     {i}")
+    print(f"  total evals:     {total_evals}")
+    print(f"  evals/sec:       {total_evals / times[-1]:.0f}")
+    print(f"  final top10:     {top10s[-1]:.3f}   (more stable than max)")
+    print(f"  AUC archive_best:{auc_best:.3f}     (time-avg best, integrates whole run)")
+    print(f"  AUC top10:       {auc_top10:.3f}     (time-avg top10, smoothest signal)")
+    for thr in [2.0, 3.0, 4.0, 5.0]:
+        t = time_to(thr)
+        print(f"  time to fit>={thr}: {f'{t:.1f}s' if t is not None else 'not reached'}")
+
+    import matplotlib.pyplot as plt
+    display = np.where(alg.archive_fit > -np.inf, alg.archive_fit, np.nan)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(display.T, origin='lower', aspect='auto', cmap='viridis',
+                   extent=[alg.xrange[0], alg.xrange[1], alg.yrange[0], alg.yrange[1]])
+    plt.colorbar(im, ax=ax, label='fitness')
+    ax.set_xlabel('mean |angular velocity| (rad/s)')
+    ax.set_ylabel('mean thrust saturation')
+    ax.set_title(f'archive fitness — gen {alg.gen}')
+    plt.tight_layout()
+    plt.savefig('archive_heatmap.png', dpi=150)
+    plt.show()

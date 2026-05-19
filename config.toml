@@ -15,5 +15,5 @@ gravity         = -9.81      # m/s^2, y axis
 
 thruster_offset         = 1.0        # m from center (width / 2)
 thruster_rotation_speed = 120.0      # deg/s
-thruster_max_angle      = 20          # degrees
+thruster_max_angle      = 45         # degrees
 thruster_force          = 47.088     # N (g * M * 1.2)

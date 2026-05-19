@@ -49,7 +49,7 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
     # ADD ROTATION CLIPPING
     max_angle = np.deg2rad(drone_conf['th_max_angle'])
     state[:, 4] = np.clip(state[:, 4].real, -max_angle, max_angle)
-    state[:, 5] = np.clip(state[:, 5].real, -max_angle, max_angle) 
+    state[:, 5] = np.clip(state[:, 5].real, -max_angle, max_angle)
 
     # THRUST
     # magnitude
@@ -153,7 +153,7 @@ def gen_target_chain(length, limit, dt, rng) -> np.ndarray:
     t_pos = (waypoints[segment+1] - waypoints[segment]) * fraction + waypoints[segment]
 
     return t_pos
-        
+
 
 # individuals + sim settings -> simulation stats
 def sim(individuals: list[Individual], settings, seed=None) -> dict:
@@ -166,7 +166,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     rng = np.random.default_rng(seed)
     # get the target position every tick
     tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng)
-    
+
     # init brain
     Brain = brain(individuals)
 
@@ -201,7 +201,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     mean_av  = np.zeros(N)
     mean_sat = np.zeros(N)
     total_ticks = 0
-    
+
     # prenitialize values
     prev_delta = None
     time = 0
@@ -216,7 +216,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
         #  5. velocity x,   6. volocity y
         #  7. sin(angle),   8. cos(angle)
         #  9. ang velocity
-        # 10. t1 angle,    11. t2 angle 
+        # 10. t1 angle,    11. t2 angle
 
         # deltas
         target = tick_pos[ticks]
@@ -232,6 +232,9 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
         t1_ang  = state_matrix[:, 4].real
         t2_ang  = state_matrix[:, 5].real
 
+        def slog(x):
+            return np.sign(x) * np.log1p(np.abs(x))
+
         obs = np.column_stack([
             delta.real, delta.imag,
             prev_delta.real, prev_delta.imag,
@@ -245,7 +248,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
 
         # FORWARD PASS OBSERVATIONS --------------------------------------------------------
         action_matrix = Brain.forward(obs)[:, :, 0] # getting rid of extra dim
-        
+
         # PROGRESS SIMULATION --------------------------------------------------------------
         # check if touched waypoint
         dist = np.abs(delta_world)
@@ -291,4 +294,3 @@ if __name__=="__main__":
     print(f"sim time: {sim_time:.3f}s")
     print(f"per drone: {sim_time*1000/qty:.3f}ms")
     print(f"realtime factor: {limit/sim_time:.3f}x")
-

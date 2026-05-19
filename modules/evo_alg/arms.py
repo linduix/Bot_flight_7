@@ -45,3 +45,16 @@ def gaussian(archive_indv, archive_fit, qty) -> list[Individual]:
         children.append(child)
 
     return(children)
+
+def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty):
+    rng = np.random.default_rng()
+
+    # calculate weights
+    w  = np.maximum(archive_fit, 0)
+    assert(w.sum() > 0)
+    probs = w.ravel() / w.sum()     # flatened matrix
+
+    chosen_idx = rng.choice(probs.size, size=qty, p=probs)      # choose idx based on weight
+    chosen_coords = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coord
+
+    parents = archive_indv[chosen_coords]
