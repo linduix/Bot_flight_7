@@ -1,3 +1,4 @@
+from matplotlib import colormaps
 from modules.individual import Individual
 import numpy as np
 import tomllib
@@ -54,7 +55,25 @@ def iso(archive_indv: np.ndarray, archive_fit: np.ndarray, qty):
     assert(w.sum() > 0)
     probs = w.ravel() / w.sum()     # flatened matrix
 
-    chosen_idx = rng.choice(probs.size, size=qty, p=probs)      # choose idx based on weight
-    chosen_coords = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coord
+    chosen_idx = rng.choice(probs.size, size=qty, p=probs)   # choose idx based on weight
+    pa_r, pa_c = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coords
 
-    parents = archive_indv[chosen_coords]
+    # get coords of all occupied
+    occupied = np.argwhere(archive_fit > -np.inf)
+
+    for row, col in zip(pa_r, pa_c):
+        # get parent a
+        pa   = archive_indv[row, col]
+        # get the distances from
+        diff = occupied - np.array([row, col])
+        dist = np.linalg.norm(diff, axis=1)
+        self_mask = dist == 0
+
+        b_weights = 1 / (1 + dist ** 2)
+        b_weights[self_mask] = 0
+        assert(b_weights.sum() > 0)
+        b_probs   = b_weights / b_weights.sum()
+
+        chosen_idx = rng.choice(b_probs.size, p=b_probs)
+        pb_r, pb_c = occupied[chosen_idx]
+        pb         = archive_indv[pb_r, pb_c]
