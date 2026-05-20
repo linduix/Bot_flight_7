@@ -19,7 +19,7 @@ class MAB():
             self.arms[arm]['score'] += score
 
         # decay the old values
-        for _, stats in self.arms.items():
+        for stats in self.arms.values():
             stats['pulls'] *= self.decay
             stats['score'] *= self.decay
         self.total_pulls *= self.decay
@@ -32,7 +32,7 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(1 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(2 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value
@@ -85,7 +85,7 @@ class Archive():
 
         # if slot empty fill it and reward bandit:
         old_fit = self.fit[idx, idy]
-        if i.fitness >= old_fit:
+        if i.fitness > old_fit:
             result = True
         else:
             if i.parent_idx is not None:
@@ -142,7 +142,7 @@ class algorithm():
 
     def update(self, individuals: list[Individual]):
         bandit_score = {k: 0.0 for k in self.arms.keys()}
-        self.archive.curi_decay = 0.01 ** (1/self.batch_size) # curiosity decay factor
+        self.archive.curi_decay = 0.1 ** (8/self.batch_size) # curiosity decay factor
 
         stats = {'updates': 0, 'bandit_score': bandit_score}
         for i in individuals:
@@ -156,8 +156,6 @@ class algorithm():
         # update the bandit
         if self.gen > 0:
             self.bandit.update_stats(bandit_score)
-        if self.gen > 99:
-            self.bandit.decay = 0.99
 
         # decay improvement matrix
         self.archive.impr *= 0.95
@@ -181,16 +179,19 @@ class algorithm():
             i.parent_idx = None
             self.archive.insert(i)
 
-def save(path, alg, settings, seeds):
+def save(path, alg, settings, seed):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'wb') as f:
-        pkl.dump({'alg': alg, 'settings': settings, 'seeds': seeds}, f)
+        pkl.dump({'alg': alg, 'settings': settings, 'seed': seed}, f)
     os.replace(tmp, path)
 
 def load(path) -> tuple:
     with open(path, 'rb') as f:
         data = pkl.load(f)
-    return data['alg'], data['settings'], data['seeds']
+    return data['alg'], data['settings'], data['seed']
 
 if __name__ == "__main__":
     import time

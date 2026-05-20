@@ -18,7 +18,7 @@ def show_archive(alg):
         ('improvement',   alg.archive.impr, 'plasma'),
     ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+    fig, axes = plt.subplots(2, 2, figsize=(9, 9))
     axes = axes.flatten()
     for ax, (label, data, cmap) in zip(axes, panels):
         display = np.where(occ_mask, data, np.nan)
@@ -30,7 +30,7 @@ def show_archive(alg):
         ax.set_title(f'{label} — gen {alg.gen}')
     axes[3].axis('off')
 
-    plt.tight_layout()
+    plt.subplots_adjust(left=0.08, right=0.96, top=0.93, bottom=0.08, hspace=0.45, wspace=0.3)
     plt.savefig('archive_heatmap.png', dpi=150)
     plt.show()
 
@@ -39,11 +39,11 @@ save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
 if __name__=='__main__':
     # load save
     if os.path.isfile(save_path):
-        alg, settings, seeds = load(save_path)
+        alg, settings, seed = load(save_path)
     else:
         alg = algorithm(resolution=50)
         settings  = {'limit': 10.0, 'length': 10.0}
-        seeds = np.random.randint(0, 100, size=5)
+        seed = np.random.randint(0, 100)
 
     simulator = sim
 
@@ -62,7 +62,6 @@ if __name__=='__main__':
             individuals, propose_stats = alg.propose(population, None)
 
             # score individuals         -> updates individuals + returns stats
-            seed = np.random.choice(seeds)
             sim_stats = simulator(individuals, settings, seed=seed)
 
             # send results to algorithm -> returns stats
@@ -80,10 +79,10 @@ if __name__=='__main__':
             budget_str = ' | '.join(f"{k} {v:>4d}" for k, v in budget.items())
             print(f"  propose:    {budget_str}")
             means = {arm: (s['score']/s['pulls'] if s['pulls'] > 0 else 0.0) for arm, s in alg.bandit.arms.items()}
-            top_mean = max(means.values()) if means else 0.0
+            top_b = max(budget.values()) if budget else 0
             print(f"              {'arm':<10} {'mean':>7} {'ratio':>7}")
             for arm, m in means.items():
-                ratio = m/top_mean if top_mean > 0 else 0.0
+                ratio = budget.get(arm, 0)/top_b if top_b > 0 else 0.0
                 print(f"              {arm:<10} {m:>7.3f} {ratio:>6.2f}x")
 
             # sim: per-batch fitness
@@ -95,27 +94,28 @@ if __name__=='__main__':
             print(f"              bandit_score: {score_str}", flush=True)
 
             # curriculum: current difficulty
-            print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f}", flush=True)
+            top10 = np.sort(alg.archive.fit, axis=None)[-10:].mean()
+            print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
             # pool transition branch:
-            if update_stats['archive_best'] / settings['limit'] > 0.8:
+            if top10 / settings['limit'] > 0.8:
                 # update curriculum at pool end
                 settings['length'] *= 1.05
                 # regenerate seed pool
-                seeds = np.random.randint(0, 100, size=5)
+                seed = np.random.randint(0, 100)
                 # revalidate existing best drones at pool end
                 elites = alg.archive.pop()
-                simulator(elites, settings, seed=seeds[0])
+                simulator(elites, settings, seed=seed)
                 alg.reset(elites)
                 print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
 
             # save checkpoint at generation threshold/new best
             if alg.gen % 50 == 0:
-                save(save_path, alg, settings, seeds)
+                save(save_path, alg, settings, seed)
                 print(f"  -> checkpoint saved (gen {alg.gen})", flush=True)
 
     except KeyboardInterrupt:
         print('Terminating Training')
-        save(save_path, alg, settings, seeds)
+        save(save_path, alg, settings, seed)
         print('Saved at', save_path)
         show_archive(alg)

@@ -112,8 +112,8 @@ class ParticlePool:
             screen.blit(surf, (sx - radius, sy - radius))
 
 
-def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, drone_conf, n):
-    for i in range(n):
+def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, drone_conf, indices):
+    for i in indices:
         t1_thrust = action_matrix[i, 0]
         t2_thrust = action_matrix[i, 1]
         pos   = state_matrix[i, 0]
@@ -147,13 +147,23 @@ def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, dr
             for _ in range(2):
                 speed = np.random.uniform(7, 12) * t2_thrust
                 vel   = direction * speed + t2_vel
-                pool.spawn(t2pos, vel, start_alpha=255 * t2_thrust)
+                pool.spawn(t2pos, vel, start_alpha=100 * t2_thrust)
 
 
-def sim(individuals: list[Individual], settings, seed=None) -> dict:
-    # highlight highest-fitness drone if all have a saved fitness
+def sim(individuals: list[Individual], settings, seed=None, featured=None) -> dict:
+    # `featured` = indices drawn as full sprites; the rest render as ghost lines.
+    # `highlight` (single) = max-fitness among featured; gets ring + thruster particles.
     fits = [ind.fitness for ind in individuals]
-    highlight = int(np.argmax(fits)) if all(f is not None for f in fits) else None
+    if featured is None:
+        featured = set(range(len(individuals)))
+    else:
+        featured = set(featured)
+    if featured and all(fits[i] is not None for i in featured):
+        highlight = max(featured, key=lambda i: fits[i])
+    elif featured:
+        highlight = int(np.random.choice(list(featured)))
+    else:
+        highlight = int(np.random.randint(len(individuals)))
     pg.init()
     screen = pg.display.set_mode((SCREEN_W, SCREEN_H))
     pg.display.set_caption("Sim1 Visual")
@@ -163,6 +173,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     drone_conf = get_drone_conf(config_path)
     Brain = brain(individuals)
     N = len(individuals)
+    S = 4  # trials per drone — only trial 0 is rendered; rest run "headlessly" so chains can be shown faintly
 
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
@@ -171,36 +182,36 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     frame_dt = 1 / 60
     dt = frame_dt / speed_factor
 
-    # generated target chain (same logic as headless sim)
+    # generated target chains (one per trial, same logic as headless sim)
     rng = np.random.default_rng(seed)
-    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng)
+    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S)  # (S, n_ticks)
 
-    # randomized init, identical across drones (match sim1 for fair swap-in)
-    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
-    ang_vel0 = rng.uniform(-0.5, 0.5)
+    # randomized init, identical across drones AND trials here (visual only — only trial 0 displays)
+    angle0   = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
+    ang_vel0 = np.random.uniform(-0.5, 0.5)
     v_init_max = 1
-    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
-    v_dir    = rng.uniform(-np.pi, np.pi)
+    v_mag    = np.sqrt(np.random.uniform(0, 1)) * v_init_max
+    v_dir    = np.random.uniform(-np.pi, np.pi)
     vel0     = v_mag * np.exp(1j * v_dir)
 
-    state_matrix = np.zeros((N, 6), dtype=complex)
-    state_matrix[:, 0] = 0j
-    state_matrix[:, 1] = vel0
-    state_matrix[:, 2] = angle0
-    state_matrix[:, 3] = ang_vel0
+    state_matrix = np.zeros((N, 6, S), dtype=complex)
+    state_matrix[:, 0, :] = 0j
+    state_matrix[:, 1, :] = vel0
+    state_matrix[:, 2, :] = angle0
+    state_matrix[:, 3, :] = ang_vel0
 
-    action_matrix = np.zeros((N, 4), dtype=float)
+    action_matrix = np.zeros((N, 4, S), dtype=float)
 
     # simulation state arrays
-    toggle = np.zeros(N, dtype=bool)
-    ticks  = np.zeros(N, dtype=int)
+    toggle = np.zeros((N, S), dtype=bool)
+    ticks  = np.zeros((N, S), dtype=int)
     particles = ParticlePool(max_particles=4000)
     prev_delta = None
 
     # fitness + descriptor accumulators
-    fitness  = np.zeros(N)
-    mean_av  = np.zeros(N)
-    mean_sat = np.zeros(N)
+    fitness  = np.zeros((N, S))
+    mean_av  = np.zeros((N, S))
+    mean_sat = np.zeros((N, S))
     total_ticks = 0
 
     sim_time = 0.0
@@ -216,33 +227,33 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
         # UPDATE PHYSICS
         state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
 
-        # per-drone target from generated chain (clamp to last tick)
-        idx = np.minimum(ticks, len(tick_pos) - 1)
-        target = tick_pos[idx]
+        # per-(drone, trial) target — clamp ticks to last chain entry per trial
+        idx = np.minimum(ticks, tick_pos.shape[1] - 1)           # (N, S)
+        target = tick_pos[np.arange(S), idx]                    # (N, S)
 
         # MAKE OBSERVATION ARRAY
-        delta_world = target - state_matrix[:, 0]
-        delta = delta_world * np.exp(-1j * state_matrix[:, 2].real)
+        delta_world = target - state_matrix[:, 0, :]
+        delta = delta_world * np.exp(-1j * state_matrix[:, 2, :].real)
         if prev_delta is None:
             prev_delta = delta.copy()
-        vel     = state_matrix[:, 1] * np.exp(-1j * state_matrix[:, 2].real)
-        angle   = state_matrix[:, 2].real
-        ang_vel = state_matrix[:, 3].real
-        t1_ang  = state_matrix[:, 4].real
-        t2_ang  = state_matrix[:, 5].real
+        vel     = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
+        angle   = state_matrix[:, 2, :].real
+        ang_vel = state_matrix[:, 3, :].real
+        t1_ang  = state_matrix[:, 4, :].real
+        t2_ang  = state_matrix[:, 5, :].real
 
-        obs = np.column_stack([
+        obs = np.stack([
             delta.real, delta.imag,
             prev_delta.real, prev_delta.imag,
             vel.real, vel.imag,
             np.sin(angle), np.cos(angle),
             ang_vel,
             t1_ang, t2_ang
-        ])[:, :, np.newaxis]
+        ], axis=1)  # (N, 11, S)
 
         prev_delta = delta.copy()
 
-        action_matrix = Brain.forward(obs)[:, :, 0]
+        action_matrix = Brain.forward(obs)  # (N, 4, S)
 
         # PROGRESS SIMULATION
         dist = np.abs(delta_world)
@@ -254,39 +265,66 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
 
         # descriptors
         mean_av += np.abs(ang_vel)
-        t1 = np.maximum(action_matrix[:, 0], 0)
-        t2 = np.maximum(action_matrix[:, 1], 0)
+        t1 = np.maximum(action_matrix[:, 0, :], 0)
+        t2 = np.maximum(action_matrix[:, 1, :], 0)
         mean_sat += (np.maximum(t1, t2) > 0.9)
 
         ticks += toggle
         total_ticks += 1
         sim_time += dt
 
+        # ---- RENDER (trial 0 only) ----
+        # Slice down to trial 0 for everything visual. State views are 2D (N, 6) again.
+        state_t0  = state_matrix[:, :, 0]
+        action_t0 = action_matrix[:, :, 0]
+        target_t0 = target[:, 0]
+
         # particles + draw
-        spawn_thruster_particles(particles, state_matrix, action_matrix, drone_conf, N)
+        spawn_thruster_particles(particles, state_t0, action_t0, drone_conf, [highlight])
         particles.update(dt)
 
         screen.fill((20, 20, 20))
         particles.draw(screen)
 
-        pg.draw.line(screen, (200, 60, 60),
-                     world_to_screen(0j), world_to_screen(tick_pos[0]), 1)
+        # draw all S target chains + approach lines: trial 0 full color, others very faint
+        chain_layer = pg.Surface((SCREEN_W, SCREEN_H), pg.SRCALPHA)
+        stride = max(1, tick_pos.shape[1] // 200)
+        origin_px = world_to_screen(0j)
+        for s in range(S):
+            if s == 0:
+                chain_color    = (60, 100, 60, 255)
+                approach_color = (200, 60, 60, 255)
+            else:
+                chain_color    = (60, 100, 60, 60)
+                approach_color = (200, 60, 60, 60)
+            # approach line: origin → wp1 for this trial
+            pg.draw.line(chain_layer, approach_color, origin_px, world_to_screen(tick_pos[s, 0]), 1)
+            # path through the chain
+            pts = [world_to_screen(p) for p in tick_pos[s, ::stride]]
+            if len(pts) > 1:
+                pg.draw.lines(chain_layer, chain_color, False, pts, 1)
+        screen.blit(chain_layer, (0, 0))
 
-        path_pts = [world_to_screen(p) for p in tick_pos[::max(1, len(tick_pos)//200)]]
-        if len(path_pts) > 1:
-            pg.draw.lines(screen, (60, 100, 60), False, path_pts, 1)
+        # non-featured: simple dots (trial 0 positions only)
+        dot_layer = pg.Surface((SCREEN_W, SCREEN_H), pg.SRCALPHA)
         for i in range(N):
-            tx, ty = world_to_screen(target[i])
-            pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
+            if i in featured:
+                continue
+            sx, sy = world_to_screen(state_t0[i, 0])
+            pg.draw.circle(dot_layer, (180, 180, 180, 70), (sx, sy), 3)
+        screen.blit(dot_layer, (0, 0))
 
-        for i in range(N):
+        # featured (incl. highlight): low-alpha full sprites — trial 0 only
+        for i in featured:
             if i == highlight:
-                continue   # draw highlighted last so it sits on top
-            draw_drone(screen, state_matrix[i], drone_surf, thruster_surf, drone_conf, alpha=100)
+                continue
+            draw_drone(screen, state_t0[i], drone_surf, thruster_surf, drone_conf, alpha=140)
         if highlight is not None:
-            hx, hy = world_to_screen(state_matrix[highlight, 0])
+            hx, hy = world_to_screen(state_t0[highlight, 0])
             pg.draw.circle(screen, (255, 220, 60), (hx, hy), 18, 2)
-            draw_drone(screen, state_matrix[highlight], drone_surf, thruster_surf, drone_conf, alpha=255)
+            draw_drone(screen, state_t0[highlight], drone_surf, thruster_surf, drone_conf, alpha=255)
+            tx, ty = world_to_screen(target_t0[highlight])
+            pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
         fps = clock.get_fps()
         screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
@@ -301,8 +339,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
         mean_sat /= total_ticks
 
     for i, ind in enumerate(individuals):
-        ind.fitness = fitness[i]
-        ind.descriptors = {'ang_vel': mean_av[i], 'saturation': mean_sat[i]}
+        ind.fitness = fitness[i, :].mean()
+        ind.descriptors = {'ang_vel': mean_av[i, :].mean(), 'saturation': mean_sat[i, :].mean()}
 
     return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}
 
@@ -313,8 +351,31 @@ if __name__ == "__main__":
 
     save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
     alg, settings, _ = load(save_path)
-    # grid-aligned stride-4 sample of the archive (4^2 = 16x reduction)
-    elites = [x for x in alg.archive.indv[::4, ::4].flat if x is not None]
-    print(f"loaded {len(elites)} elites from {save_path} (gen {alg.gen})")
+
+    # 3x3 coarse bin → best elite per bin (featured, full sprite),
+    # everything else → ghost line art.
+    grid = alg.archive.indv
+    R, C = grid.shape
+    K = 3
+    featured_set = []
+    seen = set()
+    for i in range(K):
+        for j in range(K):
+            block = grid[i*R//K:(i+1)*R//K, j*C//K:(j+1)*C//K]
+            cands = [x for x in block.flat if x is not None]
+            if cands:
+                best = max(cands, key=lambda x: x.fitness)
+                featured_set.append(best)
+                seen.add(id(best))
+
+    rest = [x for x in grid.flat if x is not None and id(x) not in seen]
+    elites = featured_set + rest
+    featured_idx = list(range(len(featured_set)))
+
+    print(f"loaded {len(elites)} elites ({len(featured_set)} featured) from {save_path} (gen {alg.gen})")
     print(f"settings: {settings}")
-    sim(elites, settings)
+    try:
+        while True:
+            sim(elites, settings, featured=featured_idx)
+    except KeyboardInterrupt:
+        pass
