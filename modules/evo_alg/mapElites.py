@@ -3,6 +3,7 @@ from modules.evo_alg import arms
 from typing import Callable, cast
 import pickle as pkl
 import numpy as np
+import os
 
 class MAB():
     def __init__(self, arms: list[str]) -> None:
@@ -59,10 +60,11 @@ class Archive():
 
         # archive matrices
         self.res  = res
-        self.indv: np.ndarray = np.empty((res, res), dtype=object) # matrix of Individuals
-        self.fit : np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
-        self.curi: np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
-        self.impr: np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
+        self.indv:    np.ndarray = np.empty((res, res), dtype=object) # matrix of Individuals
+        self.fit :    np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
+        self.curi:    np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
+        self.impr:    np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
+        self.updates: np.ndarray = np.full((res, res), 0)             # updates tracking matrix
 
         self.curi_decay = 0.99
 
@@ -172,6 +174,7 @@ class algorithm():
 
     def reset(self, initial_pop: list[Individual]):
         res = self.archive.res
+        updates = self.archive.updates
         self.archive = Archive(res)
 
         for i in initial_pop:
@@ -179,9 +182,12 @@ class algorithm():
             self.archive.insert(i)
 
 def save(path, alg, settings, seeds):
-    with open(path, 'wb') as f:
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
         pkl.dump({'alg': alg, 'settings': settings, 'seeds': seeds}, f)
-def load(path):
+    os.replace(tmp, path)
+
+def load(path) -> tuple:
     with open(path, 'rb') as f:
         data = pkl.load(f)
     return data['alg'], data['settings'], data['seeds']
