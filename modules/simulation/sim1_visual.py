@@ -150,8 +150,7 @@ def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, dr
                 pool.spawn(t2pos, vel, start_alpha=255 * t2_thrust)
 
 
-def run_visual(individuals: list[Individual], settings: dict | None = None, seed=None):
-    settings = settings or {'length': 50, 'limit': 10}
+def sim(individuals: list[Individual], settings, seed=None) -> dict:
     pg.init()
     screen = pg.display.set_mode((SCREEN_W, SCREEN_H))
     pg.display.set_caption("Sim1 Visual")
@@ -160,45 +159,59 @@ def run_visual(individuals: list[Individual], settings: dict | None = None, seed
 
     drone_conf = get_drone_conf(config_path)
     Brain = brain(individuals)
-    n = len(individuals)
+    N = len(individuals)
 
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
 
-    dt = 1 / 60
-
     speed_factor = 5
+    frame_dt = 1 / 60
+    dt = frame_dt / speed_factor
+
     # generated target chain (same logic as headless sim)
     rng = np.random.default_rng(seed)
-    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt/speed_factor, rng)
+    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng)
 
-    # randomized init, identical across drones (fairness)
-    angle0   = rng.uniform(-np.deg2rad(90), np.deg2rad(90))
-    ang_vel0 = rng.uniform(-2, 2)
-    v_init_max = 5
-    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
+    # randomized init, identical across drones (match sim1 for fair swap-in)
+    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
+    ang_vel0 = rng.uniform(-0.5, 0.5)
+    v_init_max = 1
+    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
     v_dir    = rng.uniform(-np.pi, np.pi)
     vel0     = v_mag * np.exp(1j * v_dir)
 
-    state_matrix = np.zeros((n, 6), dtype=complex)
+    state_matrix = np.zeros((N, 6), dtype=complex)
     state_matrix[:, 0] = 0j
     state_matrix[:, 1] = vel0
     state_matrix[:, 2] = angle0
     state_matrix[:, 3] = ang_vel0
 
-    action_matrix = np.zeros((n, 4), dtype=float)
+    action_matrix = np.zeros((N, 4), dtype=float)
 
     # simulation state arrays
-    toggle = np.zeros(n, dtype=bool)
-    ticks  = np.zeros(n, dtype=int)
+    toggle = np.zeros(N, dtype=bool)
+    ticks  = np.zeros(N, dtype=int)
     particles = ParticlePool(max_particles=4000)
     prev_delta = None
 
-    while True:
+    # fitness + descriptor accumulators
+    fitness  = np.zeros(N)
+    mean_av  = np.zeros(N)
+    mean_sat = np.zeros(N)
+    total_ticks = 0
+
+    sim_time = 0.0
+    quit_early = False
+    while sim_time < settings['limit']:
         for event in pg.event.get():
             if event.type == pg.QUIT:
-                pg.quit()
-                return
+                quit_early = True
+                break
+        if quit_early:
+            break
+
+        # UPDATE PHYSICS
+        state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
 
         # per-drone target from generated chain (clamp to last tick)
         idx = np.minimum(ticks, len(tick_pos) - 1)
@@ -228,43 +241,65 @@ def run_visual(individuals: list[Individual], settings: dict | None = None, seed
 
         action_matrix = Brain.forward(obs)[:, :, 0]
 
-        # progress chain: touched drones advance ticks
+        # PROGRESS SIMULATION
         dist = np.abs(delta_world)
         toggle |= dist < 0.5
-        ticks += toggle
 
-        state_matrix = physics_update(dt/speed_factor, state_matrix, action_matrix, drone_conf)
-        spawn_thruster_particles(particles, state_matrix, action_matrix, drone_conf, n)
-        particles.update(dt/speed_factor)
+        # fitness: 0.01x pre-touch, 1x post-touch
+        scale = np.where(toggle, 1.0, 0.01)
+        fitness += scale * dt / (1 + dist)
+
+        # descriptors
+        mean_av += np.abs(ang_vel)
+        t1 = np.maximum(action_matrix[:, 0], 0)
+        t2 = np.maximum(action_matrix[:, 1], 0)
+        mean_sat += (np.maximum(t1, t2) > 0.9)
+
+        ticks += toggle
+        total_ticks += 1
+        sim_time += dt
+
+        # particles + draw
+        spawn_thruster_particles(particles, state_matrix, action_matrix, drone_conf, N)
+        particles.update(dt)
 
         screen.fill((20, 20, 20))
-
         particles.draw(screen)
 
-        # draw origin -> wp1 (red, non-moving spawn-to-target leg)
         pg.draw.line(screen, (200, 60, 60),
                      world_to_screen(0j), world_to_screen(tick_pos[0]), 1)
 
-        # draw chain path (faint) + every drone's current target
         path_pts = [world_to_screen(p) for p in tick_pos[::max(1, len(tick_pos)//200)]]
         if len(path_pts) > 1:
             pg.draw.lines(screen, (60, 100, 60), False, path_pts, 1)
-        for i in range(n):
+        for i in range(N):
             tx, ty = world_to_screen(target[i])
             pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
-        for i in range(n):
+        for i in range(N):
             draw_drone(screen, state_matrix[i], drone_surf, thruster_surf, drone_conf, alpha=180)
 
         fps = clock.get_fps()
-        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {n}", True, (150, 150, 150)), (10, 10))
+        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
 
         pg.display.flip()
         clock.tick(60)
+
+    pg.quit()
+
+    if total_ticks > 0:
+        mean_av  /= total_ticks
+        mean_sat /= total_ticks
+
+    for i, ind in enumerate(individuals):
+        ind.fitness = fitness[i]
+        ind.descriptors = {'ang_vel': mean_av[i], 'saturation': mean_sat[i]}
+
+    return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}
 
 
 if __name__ == "__main__":
     from modules.evo_alg.stub import evostub
     alg = evostub()
     indv, _ = alg.propose(100, None)
-    run_visual(indv)
+    sim(indv, {'limit': 10, 'length': 50})

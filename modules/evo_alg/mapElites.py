@@ -1,6 +1,7 @@
 from modules.individual import Individual
 from modules.evo_alg import arms
 from typing import Callable, cast
+import pickle as pkl
 import numpy as np
 
 class MAB():
@@ -9,7 +10,7 @@ class MAB():
         self.total_pulls = 0
         self.arms = {}
         for k in arms:
-            self.arms[k] = {'pulls': 0, 'score': 0, 'value': np.inf}
+            self.arms[k] = {'pulls': 0.0, 'score': 0.0, 'value': np.inf}
 
     def update_stats(self, scores: dict[str, float]):
         # update the new scores
@@ -56,11 +57,14 @@ class Archive():
         self.xrange: tuple = (0, 3)
         self.yrange: tuple = (0, 1)
 
+        # archive matrices
         self.res  = res
         self.indv: np.ndarray = np.empty((res, res), dtype=object) # matrix of Individuals
         self.fit : np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
         self.curi: np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
         self.impr: np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
+
+        self.curi_decay = 0.99
 
     def coordinates(self, i: Individual) -> tuple[int, int]:
         # calculate the archive coordinates for individual
@@ -72,9 +76,36 @@ class Archive():
         idy = np.clip(idy, 0, self.res - 1) # keep index in bounds
 
         return idx, idy
-    
-    def get(self, row, col) -> Individual:
+
+    def insert(self, i: Individual) -> bool:
+        result = False
+        idx, idy = self.coordinates(i)
+
+        # if slot empty fill it and reward bandit:
+        old_fit = self.fit[idx, idy]
+        if i.fitness >= old_fit:
+            result = True
+        else:
+            if i.parent_idx is not None:
+                self.curi[i.parent_idx] = max(self.curi[i.parent_idx] * self.curi_decay, 0.01)
+            return result
+
+        # update the archivess
+        self.fit[idx, idy]  =  i.fitness
+        self.indv[idx, idy] =  i
+        if i.parent_idx is not None:
+            self.curi[i.parent_idx] += 1
+        if old_fit != -np.inf:
+            self.impr[idx, idy] += i.fitness - old_fit
+
+        return result
+
+    def get(self, row: int, col: int) -> Individual:
         return cast(Individual, self.indv[row, col])
+
+    def pop(self) -> list[Individual]:
+        indv = [x for x in self.indv.flat if x is not None]
+        return cast(list[Individual], indv)
 
 class algorithm():
     def __init__(self, resolution) -> None:
@@ -109,31 +140,16 @@ class algorithm():
 
     def update(self, individuals: list[Individual]):
         bandit_score = {k: 0.0 for k in self.arms.keys()}
-        curi_decay = 0.01 ** (1/self.batch_size) # curiosity decay factor
+        self.archive.curi_decay = 0.01 ** (1/self.batch_size) # curiosity decay factor
 
         stats = {'updates': 0, 'bandit_score': bandit_score}
         for i in individuals:
-            idx, idy = self.archive.coordinates(i)
+            success = self.archive.insert(i)
 
-            # if slot empty fill it and reward bandit:
-            old_fit = self.archive.fit[idx, idy]
-            if i.fitness >= old_fit:
+            # if successful update, reward bandit:
+            if success:
                 stats['updates'] += 1
-            else:
-                if i.parent_idx is None:
-                    continue
-                self.archive.curi[i.parent_idx] = max(self.archive.curi[i.parent_idx] * 0.99, 0.01)
-                continue
-
-            # update the archives
-            self.archive.fit[idx, idy]  =  i.fitness
-            self.archive.indv[idx, idy] =  i
-            if i.parent_idx is not None:
-                self.archive.curi[i.parent_idx] += 1
-            if old_fit != -np.inf:
-                self.archive.impr[idx, idy] += i.fitness - old_fit
-
-            bandit_score[i.tag] += 1
+                bandit_score[i.tag] += 1
 
         # update the bandit
         if self.gen > 0:
@@ -154,8 +170,21 @@ class algorithm():
         self.gen += 1
         return stats
 
-    def revalidate(self, individual):
-        pass
+    def reset(self, initial_pop: list[Individual]):
+        res = self.archive.res
+        self.archive = Archive(res)
+
+        for i in initial_pop:
+            i.parent_idx = None
+            self.archive.insert(i)
+
+def save(path, alg, settings, seeds):
+    with open(path, 'wb') as f:
+        pkl.dump({'alg': alg, 'settings': settings, 'seeds': seeds}, f)
+def load(path):
+    with open(path, 'rb') as f:
+        data = pkl.load(f)
+    return data['alg'], data['settings'], data['seeds']
 
 if __name__ == "__main__":
     import time
