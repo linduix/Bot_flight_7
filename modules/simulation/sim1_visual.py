@@ -8,7 +8,7 @@ import numpy as np
 import pygame as pg
 
 
-METERS_TO_PIXELS = 12
+METERS_TO_PIXELS = 30
 SCREEN_W = 1280
 SCREEN_H = 720
 
@@ -151,6 +151,9 @@ def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, dr
 
 
 def sim(individuals: list[Individual], settings, seed=None) -> dict:
+    # highlight highest-fitness drone if all have a saved fitness
+    fits = [ind.fitness for ind in individuals]
+    highlight = int(np.argmax(fits)) if all(f is not None for f in fits) else None
     pg.init()
     screen = pg.display.set_mode((SCREEN_W, SCREEN_H))
     pg.display.set_caption("Sim1 Visual")
@@ -164,7 +167,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
 
-    speed_factor = 5
+    speed_factor = 1
     frame_dt = 1 / 60
     dt = frame_dt / speed_factor
 
@@ -277,7 +280,13 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
             pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
         for i in range(N):
-            draw_drone(screen, state_matrix[i], drone_surf, thruster_surf, drone_conf, alpha=180)
+            if i == highlight:
+                continue   # draw highlighted last so it sits on top
+            draw_drone(screen, state_matrix[i], drone_surf, thruster_surf, drone_conf, alpha=100)
+        if highlight is not None:
+            hx, hy = world_to_screen(state_matrix[highlight, 0])
+            pg.draw.circle(screen, (255, 220, 60), (hx, hy), 18, 2)
+            draw_drone(screen, state_matrix[highlight], drone_surf, thruster_surf, drone_conf, alpha=255)
 
         fps = clock.get_fps()
         screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
@@ -299,7 +308,13 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
 
 
 if __name__ == "__main__":
-    from modules.evo_alg.stub import evostub
-    alg = evostub()
-    indv, _ = alg.propose(100, None)
-    sim(indv, {'limit': 10, 'length': 50})
+    import os
+    from modules.evo_alg.mapElites import load
+
+    save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
+    alg, settings, _ = load(save_path)
+    # grid-aligned stride-4 sample of the archive (4^2 = 16x reduction)
+    elites = [x for x in alg.archive.indv[::4, ::4].flat if x is not None]
+    print(f"loaded {len(elites)} elites from {save_path} (gen {alg.gen})")
+    print(f"settings: {settings}")
+    sim(elites, settings)
