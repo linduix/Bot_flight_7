@@ -1,9 +1,17 @@
 from modules.individual import Individual
 from modules.evo_alg.mapElites import algorithm, save, load
-from modules.simulation.sim1 import sim
+from modules.simulation.sim1 import sim, parallel_sim
+from multiprocessing.pool import Pool
 import numpy as np
 import tomllib
 import os
+import time
+import signal
+
+
+def _worker_init():
+    # ignore SIGINT in workers — only main process handles Ctrl+C
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def show_archive(alg):
@@ -41,11 +49,12 @@ if __name__=='__main__':
     if os.path.isfile(save_path):
         alg, settings, seed = load(save_path)
     else:
-        alg = algorithm(resolution=50)
+        alg = algorithm(resolution=25)
         settings  = {'limit': 10.0, 'length': 10.0}
         seed = np.random.randint(0, 100)
 
-    simulator = sim
+    simulator = parallel_sim
+    # simulator = sim
 
     with open('config.toml', 'rb') as f:
         config = tomllib.load(f)
@@ -53,69 +62,83 @@ if __name__=='__main__':
 
     # load checkpoint
     # create Mp Pool
-    # generate simulation seed pool
-    try:
-        run = True
-        print('Training Start')
-        while run:
-            # propose networks          -> returns drone individuals + stats
-            individuals, propose_stats = alg.propose(population, None)
+    with Pool(initializer=_worker_init) as Mpool:
+        # generate simulation seed pool
+        try:
+            run = True
+            print('Training Start')
+            while run:
+                t0 = time.perf_counter()
 
-            # score individuals         -> updates individuals + returns stats
-            sim_stats = simulator(individuals, settings, seed=seed)
+                # propose networks          -> returns drone individuals + stats
+                tp0 = time.perf_counter()
+                individuals, propose_stats = alg.propose(population, None)
+                t_prop = time.perf_counter() - tp0
 
-            # send results to algorithm -> returns stats
-            update_stats = alg.update(individuals)
+                # score individuals         -> updates individuals + returns stats
+                ts0 = time.perf_counter()
+                scores, sim_stats = simulator(individuals, settings, Mpool, seed=seed)
+                # scores, sim_stats = simulator(individuals, settings, seed=seed)
+                t_sim = time.perf_counter() - ts0
 
-            # emit stats to logging
-            best = update_stats['archive_best'] if update_stats['archive_best'] is not None else 0.0
-            cov  = update_stats['coverage']
-            upd  = update_stats['updates']
+                # send results to algorithm -> returns stats
+                tu0 = time.perf_counter()
+                update_stats = alg.update(scores)
+                t_upd = time.perf_counter() - tu0
 
-            print(f"\n=== gen {alg.gen} ===")
+                elapsed = time.perf_counter() - t0
 
-            # propose: per-arm budget allocation + bandit performance relative to best arm
-            budget = propose_stats['budget']
-            budget_str = ' | '.join(f"{k} {v:>4d}" for k, v in budget.items())
-            print(f"  propose:    {budget_str}")
-            means = {arm: (s['score']/s['pulls'] if s['pulls'] > 0 else 0.0) for arm, s in alg.bandit.arms.items()}
-            top_b = max(budget.values()) if budget else 0
-            print(f"              {'arm':<10} {'mean':>7} {'ratio':>7}")
-            for arm, m in means.items():
-                ratio = budget.get(arm, 0)/top_b if top_b > 0 else 0.0
-                print(f"              {arm:<10} {m:>7.3f} {ratio:>6.2f}x")
+                # emit stats to logging
+                best = update_stats['archive_best'] if update_stats['archive_best'] is not None else 0.0
+                cov  = update_stats['coverage']
+                upd  = update_stats['updates']
 
-            # sim: per-batch fitness
-            print(f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}")
+                print(f"\n=== gen {alg.gen} [{elapsed:.2f}s] ===")
+                print(f"  timing:     prop {t_prop:>5.2f}s | sim {t_sim:>5.2f}s | upd {t_upd:>5.2f}s")
 
-            # update: archive churn + bandit reward this gen
-            score_str = ' | '.join(f"{k} {int(v):>3d}" for k, v in update_stats['bandit_score'].items())
-            print(f"  update:     coverage {cov:>4.2f} | updates {upd:>4d} | best {best:>6.3f}")
-            print(f"              bandit_score: {score_str}", flush=True)
+                # propose: per-arm budget allocation + bandit performance relative to best arm
+                budget = propose_stats['budget']
+                budget_str = ' | '.join(f"{k} {v:>4d}" for k, v in budget.items())
+                print(f"  propose:    {budget_str}")
+                means = {arm: (s['score']/s['pulls'] if s['pulls'] > 0 else 0.0) for arm, s in alg.bandit.arms.items()}
+                top_b = max(budget.values()) if budget else 0
+                print(f"              {'arm':<10} {'mean':>7} {'ratio':>7}")
+                for arm, m in means.items():
+                    ratio = budget.get(arm, 0)/top_b if top_b > 0 else 0.0
+                    print(f"              {arm:<10} {m:>7.3f} {ratio:>6.2f}x")
 
-            # curriculum: current difficulty
-            top10 = np.sort(alg.archive.fit, axis=None)[-10:].mean()
-            print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
+                # sim: per-batch fitness
+                print(f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}")
 
-            # pool transition branch:
-            if top10 / settings['limit'] > 0.8:
-                # update curriculum at pool end
-                settings['length'] *= 1.05
-                # regenerate seed pool
-                seed = np.random.randint(0, 100)
-                # revalidate existing best drones at pool end
-                elites = alg.archive.pop()
-                simulator(elites, settings, seed=seed)
-                alg.reset(elites)
-                print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
+                # update: archive churn + bandit reward this gen
+                score_str = ' | '.join(f"{k} {int(v):>3d}" for k, v in update_stats['bandit_score'].items())
+                print(f"  update:     coverage {cov:>4.2f} | updates {upd:>4d} | best {best:>6.3f}")
+                print(f"              bandit_score: {score_str}", flush=True)
 
-            # save checkpoint at generation threshold/new best
-            if alg.gen % 50 == 0:
-                save(save_path, alg, settings, seed)
-                print(f"  -> checkpoint saved (gen {alg.gen})", flush=True)
+                # curriculum: current difficulty
+                top10 = np.sort(alg.archive.fit, axis=None)[-10:].mean()
+                print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
-    except KeyboardInterrupt:
-        print('Terminating Training')
-        save(save_path, alg, settings, seed)
-        print('Saved at', save_path)
-        show_archive(alg)
+                # pool transition branch:
+                if top10 / settings['limit'] > 0.8:
+                    # update curriculum at pool end
+                    settings['length'] *= 1.05
+                    # regenerate seed pool
+                    seed = np.random.randint(0, 100)
+                    # revalidate existing best drones at pool end
+                    elites = alg.archive.pop()
+                    elites, _ = simulator(elites, settings, Mpool, seed=seed)
+                    # elites, _ = simulator(elites, settings, seed=seed)
+                    alg.reset(elites)
+                    print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
+
+                # save checkpoint at generation threshold/new best
+                if alg.gen % 50 == 0:
+                    save(save_path, alg, settings, seed)
+                    print(f"  -> checkpoint saved (gen {alg.gen})", flush=True)
+
+        except KeyboardInterrupt:
+            print('Terminating Training')
+            save(save_path, alg, settings, seed)
+            print('Saved at', save_path)
+            show_archive(alg)

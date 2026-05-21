@@ -4,7 +4,7 @@ hidden_activation = "leaky_relu"
 output_activation = "tanh"
 
 [trainer]
-population = 500
+population = 2000
 
 [drone]
 mass            = 4.0        # kg

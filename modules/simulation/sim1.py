@@ -1,7 +1,9 @@
 from modules.individual import Individual
 from modules.batch_brain import brain
+from multiprocessing.pool import Pool
 import numpy as np
 import tomllib
+import os
 
 
 # Drone constants
@@ -100,7 +102,7 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     # times   = rng.dirichlet(lengths[1:] * concentration)         # NOT including origin -> wp1 (S, segments)
     alphas  = lengths[:, 1:] * concentration   # NOT including origin -> wp1
     g       = rng.gamma(alphas, 1.0)
-    times   = g / g.sum(axis=1, keepdims=True) 
+    times   = g / g.sum(axis=1, keepdims=True)
 
     # path angles ---------------------
     maneuvers = {
@@ -152,7 +154,7 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     # get completion percentage, (timestamp - segment start time) / segment time length for each timestamp
     # super weird indexing here, basically segments is an array of column indexes pointing to cumtime column
     # each row of that is a different trial idx array, so you need the np.arrange at the start
-    # so that each col pointer lines up with its respective segment 
+    # so that each col pointer lines up with its respective segment
     # eg [0][1] means for tstamp 0 it pionts to segment 0 for first trial but to seg 1 in second trial etc
     # since theyre in order arrange lines them up to their respective trials
     trial_idx = np.arange(S, dtype=int)[:, np.newaxis] # for the extra dim
@@ -167,7 +169,7 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
 
 
 # individuals + sim settings -> simulation stats
-def sim(individuals: list[Individual], settings, seed=None) -> dict:
+def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Individual], dict]:
     # get configuration
     drone_conf = get_drone_conf(config_path)
     N = len(individuals) # drones
@@ -290,7 +292,40 @@ def sim(individuals: list[Individual], settings, seed=None) -> dict:
         ind.fitness = fitness[i, :].mean()
         ind.descriptors = {'ang_vel': mean_av[i, :].mean(), 'saturation': mean_sat[i, :].mean()}
 
-    return {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max()}
+    return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max()}
+
+def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> tuple[list[Individual], dict]:
+    # get ocpu count
+    cpus = os.cpu_count()
+    cpus = 0 if cpus is None else cpus
+    if cpus == 0:
+        raise RuntimeError('os.cpu_count() returned None')
+
+    # create the chunks
+    chunk_size = len(indivs) // max(cpus, 1)
+    chunks = []
+    for i in range(cpus):
+        start = i * chunk_size
+        if i+1 == cpus:
+            chunk = indivs[start: ]
+        else:
+            end   = (i+1) * chunk_size
+            chunk = indivs[start: end]
+        chunks.append(chunk)
+
+    args = [(chunk, settings, seed) for chunk in chunks]
+    chunk_results = Mpool.starmap(sim, args)
+
+    scored = []
+    stats  = {'fit_max': 0.0, 'fit_mean': 0.0}
+    for indvs, stat in chunk_results:
+        scored.extend(indvs)
+        stats['fit_mean'] += stat['fit_mean']
+        stats['fit_max' ] =  max(stats['fit_max' ], stat['fit_max' ])
+    stats['fit_mean'] /= cpus
+
+    return scored, stats
+
 
 if __name__=="__main__":
     import time
