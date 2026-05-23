@@ -172,8 +172,8 @@ class algorithm():
 
     def reset(self, initial_pop: list[Individual]):
         res = self.archive.res
-        updates = self.archive.updates
         self.archive = Archive(res)
+        self.bandit = MAB(list(self.arms.keys()))
 
         for i in initial_pop:
             i.parent_idx = None
@@ -193,71 +193,77 @@ def load(path) -> tuple:
         data = pkl.load(f)
     return data['alg'], data['settings'], data['seed']
 
+import signal as _signal
+def _worker_init():
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+
 if __name__ == "__main__":
     import time
+    from multiprocessing.pool import Pool
     from modules.simulation import sim1
 
     N_SEEDS     = 1
     MAX_SECONDS = 60 * 5
-    BATCH_SIZE  = 2000
-    RESOLUTION  = 50
+    BATCH_SIZE  = 4000
+    RESOLUTION  = 25
 
     results = []
-    for k in range(N_SEEDS):
-        print(f"\n=== seed {k+1}/{N_SEEDS} ===", flush=True)
-        alg = algorithm(RESOLUTION)
+    with Pool(initializer=_worker_init) as Mpool:
+        for k in range(N_SEEDS):
+            print(f"\n=== seed {k+1}/{N_SEEDS} ===", flush=True)
+            alg = algorithm(RESOLUTION)
 
-        start = time.time()
-        gen_count = 0
-        trajectory = []
-        total_evals = 0
-        while time.time() - start < MAX_SECONDS:
-            indv, propstat = alg.propose(BATCH_SIZE)
-            simstat        = sim1.sim(indv, {'limit': 10, 'length': 40})
-            updatestat     = alg.update(indv)
-            elapsed = time.time() - start
-            total_evals += BATCH_SIZE
+            start = time.time()
+            gen_count = 0
+            trajectory = []
+            total_evals = 0
+            while time.time() - start < MAX_SECONDS:
+                indv, propstat = alg.propose(BATCH_SIZE)
+                indv, simstat  = sim1.parallel_sim(indv, {'limit': 10, 'length': 10}, Mpool)
+                updatestat     = alg.update(indv)
+                elapsed = time.time() - start
+                total_evals += BATCH_SIZE
 
-            occ = alg.archive.fit[alg.archive.fit > -np.inf]
-            top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
-            trajectory.append((elapsed, updatestat['archive_best'], top10))
-            gen_count += 1
+                occ = alg.archive.fit[alg.archive.fit > -np.inf]
+                top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
+                trajectory.append((elapsed, updatestat['archive_best'], top10))
+                gen_count += 1
 
-        times  = np.array([t[0] for t in trajectory])
-        bests  = np.array([t[1] for t in trajectory])
-        top10s = np.array([t[2] for t in trajectory])
+            times  = np.array([t[0] for t in trajectory])
+            bests  = np.array([t[1] for t in trajectory])
+            top10s = np.array([t[2] for t in trajectory])
 
-        auc_best  = float(np.trapezoid(bests,  times) / times[-1])
-        auc_top10 = float(np.trapezoid(top10s, times) / times[-1])
+            auc_best  = float(np.trapezoid(bests,  times) / times[-1])
+            auc_top10 = float(np.trapezoid(top10s, times) / times[-1])
 
-        time_to = {}
-        for thr in [2.0, 3.0, 4.0, 5.0]:
-            idx = np.argmax(bests >= thr)
-            time_to[thr] = float(times[idx]) if bests[idx] >= thr else None
+            time_to = {}
+            for thr in [2.0, 3.0, 4.0, 5.0]:
+                idx = np.argmax(bests >= thr)
+                time_to[thr] = float(times[idx]) if bests[idx] >= thr else None
 
-        total_pulls = sum(s['pulls'] for s in alg.bandit.arms.values())
-        total_score = sum(s['score'] for s in alg.bandit.arms.values())
-        arm_stats = {}
-        for arm, s in alg.bandit.arms.items():
-            arm_stats[arm] = {
-                'mean':  s['score']/s['pulls'] if s['pulls'] > 0 else 0.0,
-                'pull%': s['pulls']/total_pulls if total_pulls > 0 else 0.0,
-                'score%':s['score']/total_score if total_score > 0 else 0.0,
-            }
+            total_pulls = sum(s['pulls'] for s in alg.bandit.arms.values())
+            total_score = sum(s['score'] for s in alg.bandit.arms.values())
+            arm_stats = {}
+            for arm, s in alg.bandit.arms.items():
+                arm_stats[arm] = {
+                    'mean':  s['score']/s['pulls'] if s['pulls'] > 0 else 0.0,
+                    'pull%': s['pulls']/total_pulls if total_pulls > 0 else 0.0,
+                    'score%':s['score']/total_score if total_score > 0 else 0.0,
+                }
 
-        coverage = float((alg.archive.fit > -np.inf).sum()) / (alg.archive.res ** 2)
+            coverage = float((alg.archive.fit > -np.inf).sum()) / (alg.archive.res ** 2)
 
-        results.append({
-            'gens':        gen_count,
-            'final_top10': float(top10s[-1]),
-            'auc_best':    auc_best,
-            'auc_top10':   auc_top10,
-            'coverage':    coverage,
-            'time_to':     time_to,
-            'arms':        arm_stats,
-            'alg':         alg,
-        })
-        print(f"  top10={results[-1]['final_top10']:.3f}  AUC_top10={results[-1]['auc_top10']:.3f}  cov={coverage:.2f}  gens={gen_count}", flush=True)
+            results.append({
+                'gens':        gen_count,
+                'final_top10': float(top10s[-1]),
+                'auc_best':    auc_best,
+                'auc_top10':   auc_top10,
+                'coverage':    coverage,
+                'time_to':     time_to,
+                'arms':        arm_stats,
+                'alg':         alg,
+            })
+            print(f"  top10={results[-1]['final_top10']:.3f}  AUC_top10={results[-1]['auc_top10']:.3f}  cov={coverage:.2f}  gens={gen_count}", flush=True)
 
     # ---- summary stats across seeds ----
     top10s = [r['final_top10'] for r in results]

@@ -29,14 +29,20 @@ def random(archive: Archive, qty) -> list[Individual]:
 
     return children
 
+# Explorer
 def gaussian(archive: Archive, qty) -> list[Individual]:
-    std = 0.1
+    std = 0.3
     rng = np.random.default_rng()
 
     # weight by curiosity (for exploration)
-    w = np.where(archive.fit != -np.inf, archive.curi, 0) # 0 weight for empty cells
-    assert(w.sum() > 0)
-    probs = w.ravel() / w.sum()
+    # using softmax formula
+    Temp = 0.5
+    w = archive.curi
+    w_stable = w - w.max()
+    probs = np.exp(w_stable / Temp).ravel()
+    probs[archive.fit.ravel() == -np.inf] = 0.0
+    assert(probs.sum() > 0)
+    probs /= probs.sum()
 
     # randomly choose idx from occupied coordinates
     choices = rng.choice(len(probs), size=qty, p=probs)
@@ -54,14 +60,19 @@ def gaussian(archive: Archive, qty) -> list[Individual]:
 
     return(children)
 
+# Exploiter
 def iso(archive: Archive, qty) -> list[Individual]:
     rng = np.random.default_rng()
     children = []
 
     # calculate weights by improvement (for exploitation)
-    w = np.where(archive.fit != -np.inf, archive.impr, 0) # 0 weight for empty cell
-    assert(w.sum() > 0)
-    probs = w.ravel() / w.sum() # flatened matrix
+    Temp = 0.5
+    w = archive.impr
+    w_stable = w - w.max()
+    probs = np.exp(w_stable / Temp).ravel()
+    probs[archive.fit.ravel() == -np.inf] = 0.0
+    assert(probs.sum() > 0)
+    probs /= probs.sum()
 
     chosen_idx = rng.choice(probs.size, size=qty, p=probs)   # choose idx based on weight
     pa_r, pa_c = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coords
@@ -89,8 +100,8 @@ def iso(archive: Archive, qty) -> list[Individual]:
         pb: Individual = archive.get(pb_r, pb_c)
 
         # child weight = pa weight + noise + lerp between parent a and b
-        noise_strength = 0.05
-        lerp_strength = 0.1
+        noise_strength = 0.1
+        lerp_strength = 0.4
         t = rng.standard_normal()
         w_noise = rng.standard_normal(size=pa.weights.size) * noise_strength
         b_noise = rng.standard_normal(size=pa.biases.size ) * noise_strength

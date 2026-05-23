@@ -60,6 +60,7 @@ if __name__=='__main__':
         config = tomllib.load(f)
     population = config['trainer']['population']
 
+    top10_old = 0
     # load checkpoint
     # create Mp Pool
     with Pool(initializer=_worker_init) as Mpool:
@@ -117,20 +118,24 @@ if __name__=='__main__':
 
                 # curriculum: current difficulty
                 top10 = np.sort(alg.archive.fit, axis=None)[-10:].mean()
+                top10_old = top10 if top10_old == 0 else top10_old
                 print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
                 # pool transition branch:
-                if top10 / settings['limit'] > 0.8:
-                    # update curriculum at pool end
-                    settings['length'] *= 1.05
-                    # regenerate seed pool
-                    seed = np.random.randint(0, 100)
-                    # revalidate existing best drones at pool end
-                    elites = alg.archive.pop()
-                    elites, _ = simulator(elites, settings, Mpool, seed=seed)
-                    # elites, _ = simulator(elites, settings, seed=seed)
-                    alg.reset(elites)
-                    print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
+                if alg.gen % 20 == 0:
+                    if top10 - top10_old < 0.01:
+                        # update curriculum at pool end
+                        if settings['length'] < 120:
+                            settings['length'] *= 1.05
+                        # regenerate seed pool
+                        seed = np.random.randint(0, 100)
+                        # revalidate existing best drones at pool end
+                        elites = alg.archive.pop()
+                        elites, _ = simulator(elites, settings, Mpool, seed=seed)
+                        # elites, _ = simulator(elites, settings, seed=seed)
+                        alg.reset(elites)
+                        print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
+                    top10_old = top10
 
                 # save checkpoint at generation threshold/new best
                 if alg.gen % 50 == 0:

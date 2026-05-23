@@ -173,7 +173,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # get configuration
     drone_conf = get_drone_conf(config_path)
     N = len(individuals) # drones
-    S = 4                # trials per drone
+    S = 16                # trials per drone
     dt = .016
 
     # initialize targets
