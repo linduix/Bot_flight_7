@@ -8,7 +8,7 @@ import numpy as np
 import pygame as pg
 
 
-METERS_TO_PIXELS = 30
+METERS_TO_PIXELS = 20
 SCREEN_W = 1280
 SCREEN_H = 720
 
