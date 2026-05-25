@@ -4,6 +4,13 @@ import tomllib
 
 config_path = 'config.toml'
 
+def leaky_relu(x: np.ndarray):
+    return np.maximum(x, x * 0.01)
+
+def sigmoid(x: np.ndarray):
+    return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
+
 class brain():
     def __init__(self, individuals: list[Individual]) -> None:
         with open(config_path, 'rb') as f:
@@ -39,13 +46,16 @@ class brain():
 
     def forward(self, obs: np.ndarray):
         assert obs.ndim == 3, f"obs must be 3D (n, observations, k), got shape {obs.shape}"
-
+        layers = len(self.weights)
         x = obs # ( n , observations, k ) n = drones, k = observations per drone
-        for W, b in zip(self.weights, self.biases):
+        for i,(W, b) in enumerate(zip(self.weights, self.biases)):
             x = np.einsum('noi,nik->nok',W, x)         # (n, out, in) @ (n, in, k)
             x = x + b[:, :, np.newaxis] # (n, out, k) + (n, bias, 1) added 3d axis to bias
-            x = np.tanh(x)
+            if i < layers-1:
+                x = leaky_relu(x)
+            else:
+                x[:, :2, :] = sigmoid(x[:, :2, :]) # 1-2 sigmoid
+                x[:, 2:, :] = np.tanh(x[:, 2:, :]) # 3-4 tanh
 
-        return(x) # output (n, output, k)  
-    
-
+        # thrust1, thrust2, rot1, rot2
+        return(x) # output (n, output, k)

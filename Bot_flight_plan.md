@@ -215,6 +215,7 @@ Each emitter is a class with a `propose(archive)` method returning a candidate w
 - Fast exploitation in well-explored archive regions where critic is accurate
 - Unreliable in sparse archive regions where critic has insufficient data — bandit naturally handles this by reducing arm budget when improvement rate drops
 - Accuracy gate: gradient emitter is not activated until critic achieves ~85% accuracy, measured as rank correlation on a held-out validation set of (state, action, reward) tuples. This prevents wasting bandit exploration budget on a broken arm during early training.
+- Gradient clipping: clip the gradient step applied to the genome weights by ±ε before producing the candidate, preventing the offspring from drifting too far from the parent elite in a single update. Analogous to PPO's probability ratio clip.
 - Dependent on critic quality — complementary to CMA-ES which is model-free and robust
 
 ### Bandit Manager

@@ -214,6 +214,9 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     fitness  = np.zeros((N, S))
     mean_av  = np.zeros((N, S))
     mean_sat = np.zeros((N, S))
+    sum_acti = np.zeros((N, 4, S))
+    sum_acti2 = np.zeros((N, 4, S))
+    mean_gimb = np.zeros((N, 1))
     total_ticks = 0
 
     # prenitialize values
@@ -280,6 +283,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         t2 = np.maximum(action_matrix[:, 1, :], 0)
         mean_sat += (np.maximum(t1, t2) > 0.9)
 
+        normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
+        sum_acti += normalized       # (N, 4, S)
+        sum_acti2 += normalized ** 2 # (N, 4, S)
+        mean_gimb += ((np.abs(state_matrix[:, 4, :]) + np.abs(state_matrix[:, 5, :])) / 2).mean(axis=2) # (N, 1)
+
         # forward ticks it toggled
         ticks += toggle
         total_ticks += 1
@@ -287,6 +295,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         time += dt
     mean_av  /= total_ticks
     mean_sat /= total_ticks
+
+    # TODO AVERAGE OUT DESCRIPTORS
 
     for i, ind in enumerate(individuals):
         ind.fitness = fitness[i, :].mean()

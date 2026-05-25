@@ -13,7 +13,6 @@ def _worker_init():
     # ignore SIGINT in workers — only main process handles Ctrl+C
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-
 def show_archive(alg):
     import matplotlib.pyplot as plt
     occ_mask = alg.archive.fit > -np.inf
@@ -44,12 +43,17 @@ def show_archive(alg):
 
 save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
 
+RESOLUTION = 10
+MAX_LENGTH = 50
+
 if __name__=='__main__':
     # load save
     if os.path.isfile(save_path):
         alg, settings, seed = load(save_path)
+        alg.archive.res = RESOLUTION
+
     else:
-        alg = algorithm(resolution=25)
+        alg = algorithm(resolution=RESOLUTION)
         settings  = {'limit': 10.0, 'length': 10.0}
         seed = np.random.randint(0, 100)
 
@@ -125,7 +129,7 @@ if __name__=='__main__':
                 if alg.gen % 20 == 0:
                     if top10 - top10_old < 0.01:
                         # update curriculum at pool end
-                        if settings['length'] < 120:
+                        if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05
                         # regenerate seed pool
                         seed = np.random.randint(0, 100)
