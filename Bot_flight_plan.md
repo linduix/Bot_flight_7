@@ -126,13 +126,15 @@
 
 **Primary axes (2D archive):**
 
-1. **Mean absolute angular velocity** — `mean(|ang_vel|)` across all ticks in the episode (rad/s). Low values indicate a stable, upright posture with minimal body rotation. High values indicate aggressive spinning / rapid attitude changes. Bounds: `[0, 10]` rad/s with the top bin reserved as an overflow catch-all for anything `≥ 10`. To be re-calibrated after first batch.
+1. **Mean gimbal angle** — `mean((|t1_angle| + |t2_angle|) / 2)` across all ticks and seeds (rad). Low values indicate thrusters held near the body axis (control via differential thrust magnitude). High values indicate thrusters pinned near max deflection (control via vectoring). Strictly in `[0, π/3]` by construction since each gimbal is clipped to ±60°.
 
-2. **Mean thrust saturation** — fraction of ticks where the dominant thruster output exceeds 0.9 (i.e. `mean(max(t1, t2) > 0.9)`). Strictly in `[0, 1]` by construction. Low values indicate gentle, modulated control. High values indicate bang-bang / saturated control.
+2. **Activation variance** — per-(drone, output channel, seed) variance of normalized network outputs, averaged over the output and seed axes. Outputs are normalized so every channel spans a width-1 interval (thrusts ÷1 → `[0, 1]` via sigmoid; gimbal rates ÷2 → `[-0.5, 0.5]` via tanh). Strictly in `[0, 0.25]` by Popoviciu's inequality. Low values indicate steady, low-frequency control output. High values indicate bang-bang / rapidly switching control.
 
-**Tertiary axis (for 3D archive expansion later):**
+**Backup / future axis:**
 
-3. **Mean absolute body angle** — averaged across full episode on all evaluation runs. Low values indicate conservative upright flight posture prioritizing stability. High values indicate aggressive leaning prioritizing lateral agility at the cost of vertical stability. Maps to a genuine physical tradeoff in the drone dynamics.
+3. **Control bandwidth** — see `memory/project_map_elites_descriptors.md`. Held in reserve if the primary pair under-discriminates.
+
+**Note:** these axes supersede an earlier `mean(|ang_vel|) + mean thrust saturation` pair. See `memory/project_map_elites_descriptors.md` for the rationale.
 
 ---
 
@@ -320,10 +322,8 @@ Closest published analogues: PGA-MAP-Elites + QDax multi-emitter architecture + 
 
 ## Open Items (must be resolved before implementation of archive)
 
-1. **Archive grid resolution** — depends on descriptor axis ranges, which need empirical calibration once simulation exists.
+1. **Archive grid resolution** — both descriptor axes (`mean_gimb` ∈ `[0, π/3]`, `var_action` ∈ `[0, 0.25]`) are bounded by construction, so this is purely about bin density / coverage, not edge-calibration risk.
 
 2. **Curriculum stage definitions** — specific spawn difficulty levels and transition criteria not yet defined.
 
-3. **Angular velocity descriptor upper bound** — needs empirical calibration after first batch (thrust saturation axis is already `[0, 1]` by construction).
-
-4. **Evaluation trajectory design** — standardized cursor trajectories for evaluation not yet defined. Candidates: straight line, figure-eight, sharp reversal, slow curve, stationary hover. Descriptor validity depends on consistent evaluation conditions across all candidates.
+3. **Evaluation trajectory design** — standardized cursor trajectories for evaluation not yet defined. Candidates: straight line, figure-eight, sharp reversal, slow curve, stationary hover. Descriptor validity depends on consistent evaluation conditions across all candidates.

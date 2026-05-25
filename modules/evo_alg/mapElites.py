@@ -54,9 +54,9 @@ class MAB():
 
 class Archive():
     def __init__(self, res) -> None:
-        # descriptor minmax; mean ang vel 0-3+, thrust saturation 0-1
-        self.xrange: tuple = (0, 3)
-        self.yrange: tuple = (0, 1)
+        # descriptor minmax; x: mean gimble angle, y: activation variance
+        self.xrange: tuple = (0.20, 0.75)
+        self.yrange: tuple = (0.02, 0.25)
 
         # archive matrices
         self.res  = res
@@ -64,13 +64,13 @@ class Archive():
         self.fit :    np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
         self.curi:    np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
         self.impr:    np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
-        self.updates: np.ndarray = np.full((res, res), 0)             # updates tracking matrix
+        self.updates: np.ndarray = np.full((res, res),  0)             # updates tracking matrix
 
         self.curi_decay = 0.99
 
     def coordinates(self, i: Individual) -> tuple[int, int]:
         # calculate the archive coordinates for individual
-        xval, yval = i.descriptors['ang_vel'], i.descriptors['saturation']
+        xval, yval = i.descriptors['mean_gimb'], i.descriptors['var_action']
         idx = int(((xval - self.xrange[0]) / (self.xrange[1] - self.xrange[0])) * self.res)
         idx = np.clip(idx, 0, self.res - 1) # keep index in bounds
 
@@ -316,8 +316,8 @@ if __name__ == "__main__":
         im = ax.imshow(display.T, origin='lower', aspect='auto', cmap=cmap, extent=extent) # type: ignore
         ax.set_box_aspect(1)
         plt.colorbar(im, ax=ax, label=label)
-        ax.set_xlabel('mean |angular velocity| (rad/s)')
-        ax.set_ylabel('mean thrust saturation')
+        ax.set_xlabel('mean gimbal angle (rad)')
+        ax.set_ylabel('activation variance')
         ax.set_title(f'{label} — gen {alg.gen} (final seed)')
     axes[3].axis('off')
 

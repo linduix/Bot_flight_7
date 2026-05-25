@@ -74,9 +74,9 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 ### MAP-Elites Archive
 
 - **2D behavioral descriptor grid:**
-  1. **Mean absolute angular velocity** — `mean(|ang_vel|)` across all ticks (rad/s). Low = stable posture, high = aggressive spinning. Bounds: `[0, 10]` rad/s with the top bin acting as an overflow catch-all for anything ≥ 10. Calibrate after first batch.
-  2. **Mean thrust saturation** — fraction of ticks where `max(t1, t2) > 0.9`. Strictly in `[0, 1]` by construction. Low = gentle control, high = bang-bang control.
-- **Tertiary axis** (future 3D expansion): mean absolute body angle across episode
+  1. **Mean gimbal angle** — `mean((|t1_angle| + |t2_angle|) / 2)` across all ticks and seeds (rad). Low = thrusters held near body axis, high = thrusters pinned near max deflection. Strictly in `[0, π/3]` by construction (gimbal clipped to ±60°).
+  2. **Activation variance** — per-(drone, output channel, seed) variance of normalized network outputs (thrusts ÷1, gimbal rates ÷2 → all channels in a width-1 interval), averaged over the output and seed axes. Strictly in `[0, 0.25]` by Popoviciu's inequality. Low = steady control output, high = bang-bang switching.
+- **Backup / future axis:** control bandwidth (see `memory/project_map_elites_descriptors.md`)
 - **Replacement rule:** neutral drift — new candidate replaces occupant if fitness ≥ current occupant
 - **Grid resolution:** TBD after empirical calibration of descriptor ranges
 
@@ -133,7 +133,6 @@ Algorithm Layer   →  MAP-Elites archive logic (swappable to MOEA/D without tou
 
 ## Open Items (resolve before implementing the archive)
 
-- Archive grid resolution (requires empirical descriptor range calibration from simulation)
-- Angular velocity descriptor upper bound (calibrate empirically; saturation axis is already `[0, 1]`)
+- Archive grid resolution (both axes are bounded by construction, so this is about bin density / coverage, not calibration risk on the upper edges)
 - Curriculum stage definitions (difficulty levels and transition criteria)
 - Standardized evaluation trajectory set (straight line, figure-eight, sharp reversal, slow curve, hover)

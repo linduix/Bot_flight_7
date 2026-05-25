@@ -32,8 +32,8 @@ def show_archive(alg):
         im = ax.imshow(display.T, origin='lower', aspect='auto', cmap=cmap, extent=extent) # type: ignore
         ax.set_box_aspect(1)
         plt.colorbar(im, ax=ax, label=label)
-        ax.set_xlabel('mean |angular velocity| (rad/s)')
-        ax.set_ylabel('mean thrust saturation')
+        ax.set_xlabel('mean gimbal angle (rad)')
+        ax.set_ylabel('activation variance')
         ax.set_title(f'{label} — gen {alg.gen}')
     axes[3].axis('off')
 
@@ -64,7 +64,7 @@ if __name__=='__main__':
         config = tomllib.load(f)
     population = config['trainer']['population']
 
-    top10_old = 0
+    top10_old = None
     # load checkpoint
     # create Mp Pool
     with Pool(initializer=_worker_init) as Mpool:
@@ -121,13 +121,15 @@ if __name__=='__main__':
                 print(f"              bandit_score: {score_str}", flush=True)
 
                 # curriculum: current difficulty
-                top10 = np.sort(alg.archive.fit, axis=None)[-10:].mean()
-                top10_old = top10 if top10_old == 0 else top10_old
+                finite = alg.archive.fit[np.isfinite(alg.archive.fit)]
+                top10 = np.sort(finite)[-10:].mean() if finite.size >= 10 else (finite.mean() if finite.size else 0.0)
+                if top10_old is None:
+                    top10_old = top10
                 print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
                 # pool transition branch:
                 if alg.gen % 20 == 0:
-                    if top10 - top10_old < 0.01:
+                    if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.05:
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05

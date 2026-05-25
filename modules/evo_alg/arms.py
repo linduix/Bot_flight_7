@@ -36,7 +36,7 @@ def gaussian(archive: Archive, qty) -> list[Individual]:
 
     # weight by curiosity (for exploration)
     # using softmax formula
-    Temp = 0.5
+    Temp = 0.9
     w = archive.curi
     w_stable = w - w.max()
     probs = np.exp(w_stable / Temp).ravel()
@@ -66,7 +66,7 @@ def iso(archive: Archive, qty) -> list[Individual]:
     children = []
 
     # calculate weights by improvement (for exploitation)
-    Temp = 0.5
+    Temp = 0.9
     w = archive.impr
     w_stable = w - w.max()
     probs = np.exp(w_stable / Temp).ravel()

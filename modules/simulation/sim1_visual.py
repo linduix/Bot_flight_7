@@ -187,11 +187,11 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S)  # (S, n_ticks)
 
     # randomized init, identical across drones AND trials here (visual only — only trial 0 displays)
-    angle0   = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
-    ang_vel0 = np.random.uniform(-0.5, 0.5)
+    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
+    ang_vel0 = rng.uniform(-0.5, 0.5)
     v_init_max = 1
-    v_mag    = np.sqrt(np.random.uniform(0, 1)) * v_init_max
-    v_dir    = np.random.uniform(-np.pi, np.pi)
+    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
+    v_dir    = rng.uniform(-np.pi, np.pi)
     vel0     = v_mag * np.exp(1j * v_dir)
 
     state_matrix = np.zeros((N, 6, S), dtype=complex)
@@ -209,9 +209,11 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     prev_delta = None
 
     # fitness + descriptor accumulators
-    fitness  = np.zeros((N, S))
-    mean_av  = np.zeros((N, S))
-    mean_sat = np.zeros((N, S))
+    # descriptors: mean gimbal angle, activation variance
+    fitness   = np.zeros((N, S))
+    sum_acti  = np.zeros((N, 4, S))
+    sum_acti2 = np.zeros((N, 4, S))
+    mean_gimb = np.zeros(N)
     total_ticks = 0
 
     sim_time = 0.0
@@ -264,10 +266,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         fitness += scale * dt / (1 + dist)
 
         # descriptors
-        mean_av += np.abs(ang_vel)
-        t1 = np.maximum(action_matrix[:, 0, :], 0)
-        t2 = np.maximum(action_matrix[:, 1, :], 0)
-        mean_sat += (np.maximum(t1, t2) > 0.9)
+        normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
+        sum_acti  += normalized
+        sum_acti2 += normalized ** 2
+        mean_gimb += ((np.abs(state_matrix[:, 4, :]) + np.abs(state_matrix[:, 5, :])) / 2).mean(axis=1)
 
         ticks += toggle
         total_ticks += 1
@@ -335,12 +337,15 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     pg.quit()
 
     if total_ticks > 0:
-        mean_av  /= total_ticks
-        mean_sat /= total_ticks
+        var_acti  = (sum_acti2 / total_ticks) - (sum_acti / total_ticks) ** 2  # (N, 4, S)
+        var_acti  = var_acti.mean(axis=(1, 2))                                  # (N,)
+        mean_gimb = mean_gimb / total_ticks                                     # (N,)
+    else:
+        var_acti = np.zeros(N)
 
     for i, ind in enumerate(individuals):
         ind.fitness = fitness[i, :].mean()
-        ind.descriptors = {'ang_vel': mean_av[i, :].mean(), 'saturation': mean_sat[i, :].mean()}
+        ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
     return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}
 

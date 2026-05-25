@@ -130,7 +130,7 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     # normalize --------------------------------------------------------------
     # motion fills n_segments / n_points of the timeline (origin->wp1 is non-moving)
     lengths = length * lengths                         # (S, segments + 1)
-    times   = (n_segments / n_points) * limit * times  # (S, segments)
+    times   = ((n_segments - 1) / n_points) * limit * times  # (S, segments)
 
     # gen segment pos boundaries, n_segments -> n_points boundaries
     paths     = lengths * np.exp(1j * angles)
@@ -187,12 +187,12 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # have physics states of all drones in one matrix
     # rows are drones, columns is state values
     # randomized init, identical across drones on this seed
-    angle0   = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
-    ang_vel0 = np.random.uniform(-0.5, 0.5)
+    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
+    ang_vel0 = rng.uniform(-0.5, 0.5)
 
     v_init_max = 1
-    v_mag = np.sqrt(np.random.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
-    v_dir = np.random.uniform(-np.pi, np.pi)
+    v_mag = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
+    v_dir = rng.uniform(-np.pi, np.pi)
     vel0  = v_mag * np.exp(1j * v_dir)
 
     state_matrix = np.zeros((N, 6, S), dtype=complex)
@@ -210,13 +210,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     ticks   = np.zeros((N, S), dtype=int) # ticks since touched
 
     # fitness + descriptor arrays
-    # descriptors: mean | angular velocity |, mean thrust saturation
-    fitness  = np.zeros((N, S))
-    mean_av  = np.zeros((N, S))
-    mean_sat = np.zeros((N, S))
-    sum_acti = np.zeros((N, 4, S))
+    # descriptors: mean gimbal angle, activation variance
+    fitness   = np.zeros((N, S))
+    sum_acti  = np.zeros((N, 4, S))
     sum_acti2 = np.zeros((N, 4, S))
-    mean_gimb = np.zeros((N, 1))
+    mean_gimb = np.zeros(N)
     total_ticks = 0
 
     # prenitialize values
@@ -278,29 +276,24 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         fitness += score
 
         # update descriptors
-        mean_av  += np.abs(ang_vel)
-        t1 = np.maximum(action_matrix[:, 0, :], 0)
-        t2 = np.maximum(action_matrix[:, 1, :], 0)
-        mean_sat += (np.maximum(t1, t2) > 0.9)
-
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
         sum_acti += normalized       # (N, 4, S)
         sum_acti2 += normalized ** 2 # (N, 4, S)
-        mean_gimb += ((np.abs(state_matrix[:, 4, :]) + np.abs(state_matrix[:, 5, :])) / 2).mean(axis=2) # (N, 1)
+        mean_gimb += ((np.abs(state_matrix[:, 4, :]) + np.abs(state_matrix[:, 5, :])) / 2).mean(axis=1) # (N, )
 
         # forward ticks it toggled
         ticks += toggle
         total_ticks += 1
 
         time += dt
-    mean_av  /= total_ticks
-    mean_sat /= total_ticks
 
-    # TODO AVERAGE OUT DESCRIPTORS
+    var_acti = (sum_acti2 / total_ticks) - (sum_acti / total_ticks)**2 # (N, act, S)
+    var_acti = var_acti.mean(axis=(1, 2)) # (N, )
+    mean_gimb = mean_gimb / total_ticks   # (N, )
 
     for i, ind in enumerate(individuals):
         ind.fitness = fitness[i, :].mean()
-        ind.descriptors = {'ang_vel': mean_av[i, :].mean(), 'saturation': mean_sat[i, :].mean()}
+        ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
     return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max()}
 
