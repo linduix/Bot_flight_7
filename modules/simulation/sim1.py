@@ -211,12 +211,17 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
-    fitness   = np.zeros((N, S))
-    sum_acti  = np.zeros((N, 4, S))
-    sum_acti2 = np.zeros((N, 4, S))
-    mean_gimb = np.zeros(N)
-    total_ticks = 0
+    fitness_velo = np.zeros((N, S))
+    sum_acti     = np.zeros((N, 4, S))
+    sum_acti2    = np.zeros((N, 4, S))
+    mean_gimb    = np.zeros(N)
+    total_ticks  = 0
 
+    max_a = 2 * drone_conf['th_force'] / drone_conf['M']
+    eps   = 1e-8
+    eps_d = 0.05
+    floor = 0.5   # hover tolerance, m/s
+    
     # prenitialize values
     prev_delta = None
     time = 0
@@ -270,11 +275,35 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         dist = np.abs(delta_world)
         toggle |= dist < 0.5
 
-        # give fitness for distance from target: 0.01x before touch, 1x after touch
-        scale = np.where(toggle, 1.0, 0.01)
-        score = scale * dt / ( 1 + dist )
-        fitness += score
+        # FITNESS CALULATIONS --------------------------------------------------------------
+        # vratio fitness component (error form, hover-safe):
+        prev_ticks = np.maximum(ticks - 1, 0)
+        target_prev = tick_pos[np.arange(S), prev_ticks]
+        v_target = (target - target_prev) / dt
 
+        # unit vector (direction) (N, S)
+        u         = delta_world / (dist + eps)
+        # target vel projected onto approach direction (N, S)
+        v_tgt_par = (v_target * np.conj(u)).real
+        # drone vel projected onto approach direction (N, S)
+        v_drn_par = (state_matrix[:, 1, :] * np.conj(u)).real
+        # max safe approach velocity (N, S)
+        safe_v    = np.sqrt(2 * max_a * (dist + eps_d))
+        # zero approach budget inside touch radius -> pure hover-match target
+        safe_v_term = np.where(dist > 0.5, safe_v, 0.0)
+        # ideal along-u drone vel = match target motion + approach budget (N, S)
+        ideal_par = v_tgt_par + safe_v_term
+
+        # error between drone and ideal along-u vel (N, S)
+        err   = v_drn_par - ideal_par
+        # tolerance, floored so hover (ideal=0) doesnt explode (N, S)
+        scale = np.maximum(np.abs(ideal_par), floor)
+        # inverted quadratic centered at err=0, mild negative for wrong-way ticks
+        score = np.clip(1.0 - (err / scale) ** 2, -0.5, 1.0)
+
+        fitness_velo += dt * score # (N, S)
+
+        # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
         sum_acti += normalized       # (N, 4, S)
@@ -287,15 +316,25 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
         time += dt
 
+    # finalize descriptors and fitness
     var_acti = (sum_acti2 / total_ticks) - (sum_acti / total_ticks)**2 # (N, act, S)
     var_acti = var_acti.mean(axis=(1, 2)) # (N, )
     mean_gimb = mean_gimb / total_ticks   # (N, )
+
+    # floor whole-episode fitness at 0, negatives within episode still shape gradient
+    fitness = np.maximum(fitness_velo, 0.0)
+
+    top_idx = fitness.mean(axis=1).argsort()[-5:]
+    top = fitness[top_idx, :]
+
+    # print(f'in drone std {top.std(axis=1).mean(): .2f}, total std {top.std(): .2f}, cross drone std {top.mean(axis=1).std(): .2f}, arm {individuals[top_idx[-1]].tag}')
 
     for i, ind in enumerate(individuals):
         ind.fitness = fitness[i, :].mean()
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
-    return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max()}
+    return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max(),
+                         'fit_velo': fitness_velo.mean()}
 
 def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> tuple[list[Individual], dict]:
     # get ocpu count
@@ -320,12 +359,17 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     chunk_results = Mpool.starmap(sim, args)
 
     scored = []
-    stats  = {'fit_max': 0.0, 'fit_mean': 0.0}
+    stats  = {'fit_max': -np.inf, 'fit_mean': 0.0, 'fit_velo': 0.0}
     for indvs, stat in chunk_results:
         scored.extend(indvs)
         stats['fit_mean'] += stat['fit_mean']
+        stats['fit_velo'] += stat['fit_velo']
         stats['fit_max' ] =  max(stats['fit_max' ], stat['fit_max' ])
+
     stats['fit_mean'] /= cpus
+    stats['fit_velo'] /= cpus
+
+    # print(f'fitness, {stats['fit_velo']:.2f}, {stats['fit_mean']:.2f}')
 
     return scored, stats
 

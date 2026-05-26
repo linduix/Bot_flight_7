@@ -128,7 +128,7 @@ if __name__=='__main__':
                 print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
                 # pool transition branch:
-                if alg.gen % 20 == 0:
+                if alg.gen % 25 == 0:
                     if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.05:
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
@@ -138,8 +138,11 @@ if __name__=='__main__':
                         # revalidate existing best drones at pool end
                         elites = alg.archive.pop()
                         elites, _ = simulator(elites, settings, Mpool, seed=seed)
-                        # elites, _ = simulator(elites, settings, seed=seed)
                         alg.reset(elites)
+
+                        finite = alg.archive.fit[np.isfinite(alg.archive.fit)]
+                        top10 = np.sort(finite)[-10:].mean() if finite.size >= 10 else (finite.mean() if finite.size else 0.0)
+                        
                         print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
                     top10_old = top10
 
