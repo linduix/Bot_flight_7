@@ -160,6 +160,8 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     trial_idx = np.arange(S, dtype=int)[:, np.newaxis] # for the extra dim
     fraction = (t - cumtime[trial_idx, segment]) / times[trial_idx, segment]  # type: ignore
     fraction = np.clip(fraction, 0, 1) # size (S, n_ticks)
+    # quintic jerk easing: bell-shaped velocity per segment, zero accel at waypoints
+    fraction = fraction**3 * (10 - 15 * fraction + 6 * fraction**2)
 
     # calculate lerp position in segment
     # end point - start point * lerp frac + starting point
