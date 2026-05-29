@@ -160,7 +160,7 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     trial_idx = np.arange(S, dtype=int)[:, np.newaxis] # for the extra dim
     fraction = (t - cumtime[trial_idx, segment]) / times[trial_idx, segment]  # type: ignore
     fraction = np.clip(fraction, 0, 1) # size (S, n_ticks)
-    # quintic jerk easing: bell-shaped velocity per segment, zero accel at waypoints
+    # min jerk easing: bell-shaped velocity per segment, zero accel at waypoints
     fraction = fraction**3 * (10 - 15 * fraction + 6 * fraction**2)
 
     # calculate lerp position in segment
@@ -189,10 +189,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # have physics states of all drones in one matrix
     # rows are drones, columns is state values
     # randomized init, identical across drones on this seed
-    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
-    ang_vel0 = rng.uniform(-0.5, 0.5)
+    angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
+    ang_vel0 = rng.uniform(-2.0, 2.0)
 
-    v_init_max = 1
+    v_init_max = 3
     v_mag = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
     v_dir = rng.uniform(-np.pi, np.pi)
     vel0  = v_mag * np.exp(1j * v_dir)
@@ -203,6 +203,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     state_matrix[:, 2, :] = angle0
     state_matrix[:, 3, :] = ang_vel0
     # columns 4, 5 (thruster angles) stay 0
+
+    # impulse (wind gust) params
+    impulse_prob    = 0.01
+    impulse_v_sigma = 1.5
+    impulse_w_sigma = 1.5
 
     # initial action matrix
     action_matrix = np.zeros((N, 4, S), dtype=float)
@@ -230,6 +235,13 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     while time < settings['limit']:
         # UPDATE PHYSICS
         state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+
+        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness
+        mask   = rng.random(S) < impulse_prob
+        v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
+        w_kick = rng.normal(0, impulse_w_sigma, S) * mask
+        state_matrix[:, 1, :] += v_kick
+        state_matrix[:, 3, :] += w_kick
 
         # MAKE OBSERVATION ARRAY -----------------------------------------------------------
         # obs values:
@@ -302,6 +314,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         scale = np.maximum(np.abs(ideal_par), floor)
         # inverted quadratic centered at err=0, mild negative for wrong-way ticks
         score = np.clip(1.0 - (err / scale) ** 2, -0.5, 1.0)
+        score = score / (1 + dist)
 
         fitness_velo += dt * score # (N, S)
 

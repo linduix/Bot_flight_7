@@ -96,6 +96,7 @@ if __name__=='__main__':
                 # emit stats to logging
                 best = update_stats['archive_best'] if update_stats['archive_best'] is not None else 0.0
                 cov  = update_stats['coverage']
+                disc = update_stats['discoveries']
                 upd  = update_stats['updates']
 
                 print(f"\n=== gen {alg.gen} [{elapsed:.2f}s] ===")
@@ -105,20 +106,21 @@ if __name__=='__main__':
                 budget = propose_stats['budget']
                 budget_str = ' | '.join(f"{k} {v:>4d}" for k, v in budget.items())
                 print(f"  propose:    {budget_str}")
+                gen_means = {arm: float(np.mean(f)) if (f := [i.fitness for i in scores if i.tag == arm]) else 0.0 for arm in alg.bandit.arms}
                 means = {arm: (s['score']/s['pulls'] if s['pulls'] > 0 else 0.0) for arm, s in alg.bandit.arms.items()}
                 top_b = max(budget.values()) if budget else 0
-                print(f"              {'arm':<10} {'mean':>7} {'ratio':>7}")
+                print(f"              {'arm':<10} {'mean':>7} {'gen_fit':>8} {'ratio':>7}")
                 for arm, m in means.items():
                     ratio = budget.get(arm, 0)/top_b if top_b > 0 else 0.0
-                    print(f"              {arm:<10} {m:>7.3f} {ratio:>6.2f}x")
+                    print(f"              {arm:<10} {m:>7.3f} {gen_means[arm]:>8.3f} {ratio:>6.2f}x")
 
                 # sim: per-batch fitness
                 print(f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}")
 
                 # update: archive churn + bandit reward this gen
-                score_str = ' | '.join(f"{k} {int(v):>3d}" for k, v in update_stats['bandit_score'].items())
-                print(f"  update:     coverage {cov:>4.2f} | updates {upd:>4d} | best {best:>6.3f}")
-                print(f"              bandit_score: {score_str}", flush=True)
+                score_str = ' | '.join(f"{k} {v:>6.2f}" for k, v in update_stats['bandit_score'].items())
+                print(f"  update:     coverage {cov:>4.2f} | discoveries {disc:>4d} | updates {upd:>4d} | best {best:>6.3f}")
+                print(f"              improvement: {score_str}", flush=True)
 
                 # curriculum: current difficulty
                 finite = alg.archive.fit[np.isfinite(alg.archive.fit)]
@@ -128,8 +130,8 @@ if __name__=='__main__':
                 print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
 
                 # pool transition branch:
-                if alg.gen % 25 == 0:
-                    if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.05:
+                if alg.gen % 50 == 0:
+                    if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.01:
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05
@@ -147,7 +149,7 @@ if __name__=='__main__':
                     top10_old = top10
 
                 # save checkpoint at generation threshold/new best
-                if alg.gen % 50 == 0:
+                if alg.gen % 25 == 0:
                     save(save_path, alg, settings, seed)
                     print(f"  -> checkpoint saved (gen {alg.gen})", flush=True)
 

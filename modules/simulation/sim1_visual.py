@@ -187,9 +187,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S)  # (S, n_ticks)
 
     # randomized init, identical across drones AND trials here (visual only — only trial 0 displays)
-    angle0   = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
-    ang_vel0 = rng.uniform(-0.5, 0.5)
-    v_init_max = 1
+    angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
+    ang_vel0 = rng.uniform(-2.0, 2.0)
+    v_init_max = 3
     v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
     v_dir    = rng.uniform(-np.pi, np.pi)
     vel0     = v_mag * np.exp(1j * v_dir)
@@ -199,6 +199,11 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     state_matrix[:, 1, :] = vel0
     state_matrix[:, 2, :] = angle0
     state_matrix[:, 3, :] = ang_vel0
+
+    # impulse (wind gust) params
+    impulse_prob    = 0.01
+    impulse_v_sigma = 1.5
+    impulse_w_sigma = 1.5
 
     action_matrix = np.zeros((N, 4, S), dtype=float)
 
@@ -228,6 +233,13 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
 
         # UPDATE PHYSICS
         state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+
+        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness
+        mask   = rng.random(S) < impulse_prob
+        v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
+        w_kick = rng.normal(0, impulse_w_sigma, S) * mask
+        state_matrix[:, 1, :] += v_kick
+        state_matrix[:, 3, :] += w_kick
 
         # per-(drone, trial) target — clamp ticks to last chain entry per trial
         idx = np.minimum(ticks, tick_pos.shape[1] - 1)           # (N, S)

@@ -32,7 +32,7 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(2 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(0.2 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value
@@ -79,18 +79,14 @@ class Archive():
 
         return idx, idy
 
-    def insert(self, i: Individual) -> bool:
-        result = False
+    def insert(self, i: Individual) -> float:
         idx, idy = self.coordinates(i)
-
-        # if slot empty fill it and reward bandit:
         old_fit = self.fit[idx, idy]
-        if i.fitness > old_fit:
-            result = True
-        else:
+
+        if i.fitness <= old_fit:
             if i.parent_idx is not None:
                 self.curi[i.parent_idx] = max(self.curi[i.parent_idx] * self.curi_decay, 0.01)
-            return result
+            return 0.0
 
         # update the archivess
         self.fit[idx, idy]  =  i.fitness
@@ -100,7 +96,7 @@ class Archive():
         if old_fit != -np.inf:
             self.impr[idx, idy] += i.fitness - old_fit
 
-        return result
+        return i.fitness - old_fit if old_fit != -np.inf else i.fitness
 
     def get(self, row: int, col: int) -> Individual:
         return cast(Individual, self.indv[row, col])
@@ -113,11 +109,13 @@ class algorithm():
     def __init__(self, resolution) -> None:
         self.gen = 0
         self.archive = Archive(resolution)
+        self.cma = arms.cma()
 
         self.arms: dict['str', Callable[[Archive, int], list[Individual]]] = {
             'random'  : arms.random,
             'gaussian': arms.gaussian,
-            'iso'     : arms.iso
+            'iso'     : arms.iso,
+            'cma'     : self.cma.ask
         }
         self.bandit = MAB(list(self.arms.keys()))
 
@@ -125,7 +123,7 @@ class algorithm():
         # initial bootsrap
         self.batch_size = qty
         if self.gen == 0:
-            proposition: list[Individual] = self.arms['random'](self.archive, qty)
+            proposition: list[Individual] = arms.random(self.archive, qty)
             return proposition, {'budget': {'random': qty}}
 
         # get the arm budget
@@ -144,14 +142,25 @@ class algorithm():
         bandit_score = {k: 0.0 for k in self.arms.keys()}
         self.archive.curi_decay = 0.1 ** (8/self.batch_size) # curiosity decay factor
 
-        stats = {'updates': 0, 'bandit_score': bandit_score}
+        stats = {'discoveries': 0, 'updates': 0, 'bandit_score': bandit_score}
         for i in individuals:
-            success = self.archive.insert(i)
+            idx, idy = self.archive.coordinates(i)
+            was_empty = self.archive.fit[idx, idy] == -np.inf
+            delta = self.archive.insert(i)
 
             # if successful update, reward bandit:
-            if success:
-                stats['updates'] += 1
-                bandit_score[i.tag] += 1
+            if delta > 0:
+                if was_empty:
+                    stats['discoveries'] += 1
+                else:
+                    stats['updates'] += 1
+
+                if i.tag in bandit_score:
+                    old_fit = i.fitness - delta
+                    bandit_score[i.tag] += i.fitness**2 - max(old_fit, 0.0)**2
+
+        # update cma
+        self.cma.tell(individuals)
 
         # update the bandit
         if self.gen > 0:
@@ -171,9 +180,12 @@ class algorithm():
         return stats
 
     def reset(self, initial_pop: list[Individual]):
-        res = self.archive.res
-        self.archive = Archive(res)
-        self.bandit = MAB(list(self.arms.keys()))
+        resoulution  = self.archive.res
+        self.archive = Archive(resoulution)
+
+        self.bandit      = MAB(list(self.arms.keys()))
+        self.cma         = arms.cma()
+        self.arms['cma'] = self.cma.ask
 
         for i in initial_pop:
             i.parent_idx = None

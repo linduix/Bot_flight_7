@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from cmaes import SepCMA
 if TYPE_CHECKING:
     from modules.evo_alg.mapElites import Archive
 
@@ -115,3 +116,77 @@ def iso(archive: Archive, qty) -> list[Individual]:
         children.append(child)
 
     return children
+
+class cma():
+    def __init__(self, sigma=0.1) -> None:
+        self.sigma = sigma
+
+        # dummy variables
+        self.n_weights = 0
+        self.cma     = SepCMA(mean=np.zeros(2), sigma=sigma)
+        self.pop     = np.inf
+
+        self.buffer  = []
+        self.best    = -np.inf
+        self.stag    = 0
+        self.restart = True
+
+
+    def ask(self, archive: Archive, qty) -> list[Individual]:
+        if self.restart:
+            self._reset(archive)
+            self.restart = False
+
+        children = []
+        for _ in range(qty):
+            g = self.cma.ask()
+            w = g[:self.n_weights].astype(np.float32)
+            b = g[self.n_weights:].astype(np.float32)
+            child = Individual('cma', w, b, None)
+            children.append(child)
+
+        return children
+    
+    def tell(self, individuals: list[Individual]):
+        filterd = [i for i in individuals if i.tag == 'cma']
+        for i in filterd:
+            g = np.concatenate([i.weights, i.biases])
+            assert i.fitness is not None, 'fitness is None in cma.tell'
+            self.buffer.append((g, i.fitness))
+
+        while len(self.buffer) >= self.pop:
+            batch, self.buffer = self.buffer[:self.pop] , self.buffer[self.pop:]
+            self.cma.tell([(g, -f) for g, f in batch])
+
+            best = max(f for _, f in batch)
+            if best > self.best + 1e-4:
+                self.best = best
+                self.stag = 0
+            else:
+                self.stag += 1
+
+        if self.cma.should_stop() or self.stag > 15:
+            self.restart = True
+
+    def _reset(self, archive: Archive):
+        # calculate weights by improvement (for exploitation)
+        Temp = 0.9
+        w = archive.fit.copy()
+        w_stable = w - w[np.isfinite(w)].max()
+        probs = np.exp(w_stable / Temp).ravel()
+        probs[archive.fit.ravel() == -np.inf] = 0.0
+        assert probs.sum() > 0
+        probs /= probs.sum()
+
+        chosen_idx = np.random.choice(probs.size, p=probs)   # choose idx based on weight
+        r, c = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coord
+        chosen: Individual = archive.indv[r, c] # type: ignore
+
+        # create new cma instance
+        base = np.concat([chosen.weights, chosen.biases])
+        self.cma    = SepCMA(mean=base, sigma=self.sigma)
+        self.best   = -np.inf
+        self.buffer = []
+        self.stag   = 0
+        self.pop    = self.cma.population_size
+        self.n_weights = len(chosen.weights)

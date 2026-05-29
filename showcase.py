@@ -22,10 +22,15 @@ def screen_to_world(mx: int, my: int) -> complex:
 
 def pick_featured(grid):
     # Pick the best elite from each cell of a 3x3 split of the archive grid.
+    # Returns (featured, sector_coords, present) where:
+    #   featured[k]       — the k-th picked elite
+    #   sector_coords[k]  — (row, col) in the 3x3 split for featured[k]
+    #   present           — set of (row, col) sectors that had at least one elite
     R, C = grid.shape
     K = 3
     featured = []
-    seen = set()
+    sector_coords = []
+    present = set()
     for i in range(K):
         for j in range(K):
             block = grid[i*R//K:(i+1)*R//K, j*C//K:(j+1)*C//K]
@@ -33,11 +38,52 @@ def pick_featured(grid):
             if cands:
                 best = max(cands, key=lambda x: (x.fitness if x.fitness is not None else -np.inf))
                 featured.append(best)
-                seen.add(id(best))
-    return featured
+                sector_coords.append((i, j))
+                present.add((i, j))
+    return featured, sector_coords, present
 
 
-def showcase(individuals, dt=1/60):
+def draw_sector_viz(screen, sector_coords, present, highlight, label_font):
+    # 3x3 grid in the top-right corner. Highlighted sector filled yellow,
+    # other present sectors outlined, missing sectors drawn dim.
+    K = 3
+    cell = 32
+    pad = 2
+    margin = 12
+    size = K * cell + (K + 1) * pad
+    x0 = SCREEN_W - size - margin
+    y0 = margin
+
+    # backdrop
+    bg = pg.Surface((size, size), pg.SRCALPHA)
+    bg.fill((0, 0, 0, 140))
+    screen.blit(bg, (x0, y0))
+
+    hl_sector = sector_coords[highlight] if 0 <= highlight < len(sector_coords) else None
+    for i in range(K):
+        for j in range(K):
+            rx = x0 + pad + j * (cell + pad)
+            ry = y0 + pad + i * (cell + pad)
+            rect = pg.Rect(rx, ry, cell, cell)
+            if (i, j) == hl_sector:
+                pg.draw.rect(screen, (255, 220, 60), rect)
+                pg.draw.rect(screen, (255, 255, 255), rect, 1)
+            elif (i, j) in present:
+                pg.draw.rect(screen, (60, 60, 70), rect)
+                pg.draw.rect(screen, (160, 160, 180), rect, 1)
+            else:
+                pg.draw.rect(screen, (35, 35, 40), rect)
+                pg.draw.rect(screen, (70, 70, 75), rect, 1)
+
+    # caption underneath
+    if hl_sector is not None:
+        cap = label_font.render(
+            f"#{highlight}  sector ({hl_sector[0]},{hl_sector[1]})",
+            True, (220, 220, 230))
+        screen.blit(cap, (x0, y0 + size + 4))
+
+
+def showcase(individuals, sector_coords, present, dt=1/60):
     pg.init()
     screen = pg.display.set_mode((SCREEN_W, SCREEN_H))
     pg.display.set_caption("Showcase — follow the mouse")
@@ -53,12 +99,8 @@ def showcase(individuals, dt=1/60):
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
 
-    # live score = slow EMA of 1/(1+dist); highlight switches only when a challenger
-    # beats the current leader by `switch_margin` (hysteresis prevents flicker).
-    live_score    = np.zeros(N)
-    ema_alpha     = 0.01    # ~100-frame time constant
-    switch_margin = 1.10    # challenger must be 10% better to take over
-    highlight     = 0
+    # highlight is cycled manually by mouse click (left = next, right = prev).
+    highlight = 0
 
     # init state matrix (N, 6, S)
     state_matrix  = np.zeros((N, 6, S), dtype=complex)
@@ -77,6 +119,11 @@ def showcase(individuals, dt=1/60):
                 running = False
             elif event.type == pg.KEYDOWN and event.key == pg.K_ESCAPE:
                 running = False
+            elif event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    highlight = (highlight + 1) % N
+                elif event.button == 3:
+                    highlight = (highlight - 1) % N
 
         # target = mouse position
         mx, my = pg.mouse.get_pos()
@@ -93,8 +140,6 @@ def showcase(individuals, dt=1/60):
             for i in np.where(far)[0]:
                 state_matrix[i, :, :] = 0
                 state_matrix[i, 2, :] = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
-            # crashing (drifted offscreen → respawn) halves the live score
-            live_score[far] *= 0.5
 
         # observations
         delta_world = target - state_matrix[:, 0, :]
@@ -119,13 +164,6 @@ def showcase(individuals, dt=1/60):
 
         action_matrix = Brain.forward(obs)
 
-        # update live score + highlight
-        inst = 1.0 / (1.0 + np.abs(delta_world[:, 0]))
-        live_score = (1 - ema_alpha) * live_score + ema_alpha * inst
-        challenger = int(np.argmax(live_score))
-        if live_score[challenger] > live_score[highlight] * switch_margin:
-            highlight = challenger
-
         # ---- RENDER ----
         state_t0  = state_matrix[:, :, 0]
         action_t0 = action_matrix[:, :, 0]
@@ -140,9 +178,9 @@ def showcase(individuals, dt=1/60):
         for i in range(N):
             if i == highlight:
                 continue
-            draw_drone(screen, state_t0[i], drone_surf, thruster_surf, drone_conf, alpha=140)
+            draw_drone(screen, state_t0[i], drone_surf, thruster_surf, drone_conf, alpha=55)
             px, py = world_to_screen(state_t0[i, 0])
-            lab = label_font.render(f"#{i}", True, (180, 180, 220))
+            lab = label_font.render(f"#{i}", True, (110, 110, 140))
             screen.blit(lab, lab.get_rect(center=(px, py - 30)))
 
         # highlight drone (no ring)
@@ -157,8 +195,11 @@ def showcase(individuals, dt=1/60):
         # HUD
         screen.blit(font.render(f"FPS: {clock.get_fps():.0f}  Drones: {N}", True, (150, 150, 150)),
                     (10, 10))
-        screen.blit(label_font.render("move mouse to set target — ESC to quit",
+        screen.blit(label_font.render("click to cycle drones (right-click = prev) — ESC to quit",
                                        True, (130, 130, 130)), (10, 36))
+
+        # sector viz (top-right)
+        draw_sector_viz(screen, sector_coords, present, highlight, label_font)
 
         pg.display.flip()
         clock.tick(60)
@@ -170,10 +211,10 @@ if __name__ == "__main__":
     save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
     alg, settings, _ = load(save_path)
 
-    featured = pick_featured(alg.archive.indv)
+    featured, sector_coords, present = pick_featured(alg.archive.indv)
     if not featured:
         print("No elites found in archive.")
         raise SystemExit(1)
 
     print(f"loaded {len(featured)} featured elites from {save_path} (gen {alg.gen})")
-    showcase(featured)
+    showcase(featured, sector_coords, present)
