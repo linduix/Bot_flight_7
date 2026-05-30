@@ -32,7 +32,7 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(0.2 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(0.02 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value

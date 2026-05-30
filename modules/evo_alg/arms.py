@@ -14,16 +14,22 @@ def random(archive: Archive, qty) -> list[Individual]:
     with open('config.toml', 'rb') as f:
         config = tomllib.load(f)
 
-    total_weights = 0
+    total_weights = []
     total_biases  = 0
+    stdevs = []
     shape = config['network']['layers']
     for i in range(len(shape)-1):
-        total_weights += shape[i] * shape[i+1]
-        total_biases  += shape[i+1]
+        total_weights.append(shape[i] * shape[i+1])
+        stdevs.append(np.sqrt(2 / shape[i]))
+        total_biases += shape[i+1]
 
     for _ in range(qty):
-        weights = np.random.randn(total_weights).astype(np.float32)
-        biases  = np.random.randn(total_biases ).astype(np.float32)
+        w = np.array([])
+        for weights, s in zip(total_weights, stdevs):
+            w = np.append(w, np.random.normal(0, s, weights))
+
+        weights = w.astype(np.float32)
+        biases  = np.zeros(total_biases).astype(np.float32)
 
         child   = Individual('random', weights=weights, biases=biases, parent_idx=None)
         children.append(child)
@@ -101,8 +107,8 @@ def iso(archive: Archive, qty) -> list[Individual]:
         pb: Individual = archive.get(pb_r, pb_c)
 
         # child weight = pa weight + noise + lerp between parent a and b
-        noise_strength = 0.1
-        lerp_strength = 0.4
+        noise_strength = 0.01
+        lerp_strength = 0.2
         t = rng.standard_normal()
         w_noise = rng.standard_normal(size=pa.weights.size) * noise_strength
         b_noise = rng.standard_normal(size=pa.biases.size ) * noise_strength
@@ -146,7 +152,7 @@ class cma():
             children.append(child)
 
         return children
-    
+
     def tell(self, individuals: list[Individual]):
         filterd = [i for i in individuals if i.tag == 'cma']
         for i in filterd:

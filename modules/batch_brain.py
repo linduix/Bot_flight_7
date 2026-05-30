@@ -8,7 +8,7 @@ def leaky_relu(x: np.ndarray):
     return np.maximum(x, x * 0.01)
 
 def sigmoid(x: np.ndarray):
-    return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+    return 1 / (1 + np.exp(-np.clip(x, -30, 30)))
 
 
 class brain():
@@ -49,7 +49,7 @@ class brain():
         layers = len(self.weights)
         x = obs # ( n , observations, k ) n = drones, k = observations per drone
         for i,(W, b) in enumerate(zip(self.weights, self.biases)):
-            x = np.einsum('noi,nik->nok',W, x)         # (n, out, in) @ (n, in, k)
+            x = W @ x                                  # (n, out, in) @ (n, in, k)
             x = x + b[:, :, np.newaxis] # (n, out, k) + (n, bias, 1) added 3d axis to bias
             if i < layers-1:
                 x = leaky_relu(x)

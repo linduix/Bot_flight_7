@@ -44,7 +44,7 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
     t1, t2 = np.maximum(0, t1), np.maximum(0, t2)
 
     # calculate forces (drone refrence frame) --------------------
-    rotation_speed = np.deg2rad(drone_conf['th_rotation_speed'])
+    rotation_speed = float(np.deg2rad(drone_conf['th_rotation_speed']))
     # thruster rotation
     state[:, 4, :] += rotation_speed * rot1 * dt
     state[:, 5, :] += rotation_speed * rot2 * dt
@@ -181,7 +181,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # initialize targets
     rng = np.random.default_rng(seed)
     # get the target position every tick
-    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S)
+    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S).astype(np.complex64)
 
     # init brain
     Brain = brain(individuals)
@@ -197,7 +197,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     v_dir = rng.uniform(-np.pi, np.pi)
     vel0  = v_mag * np.exp(1j * v_dir)
 
-    state_matrix = np.zeros((N, 6, S), dtype=complex)
+    state_matrix = np.zeros((N, 6, S), dtype=np.complex64)
     state_matrix[:, 0, :] = 0j         # spawn at origin
     state_matrix[:, 1, :] = vel0
     state_matrix[:, 2, :] = angle0
@@ -210,7 +210,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     impulse_w_sigma = 1.5
 
     # initial action matrix
-    action_matrix = np.zeros((N, 4, S), dtype=float)
+    action_matrix = np.zeros((N, 4, S), dtype=np.float32)
 
     # simulation progression arrays
     toggle  = np.zeros((N, S), dtype=bool) # tracks initial touch to start chain
@@ -218,10 +218,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
-    fitness_velo = np.zeros((N, S))
-    sum_acti     = np.zeros((N, 4, S))
-    sum_acti2    = np.zeros((N, 4, S))
-    mean_gimb    = np.zeros(N)
+    fitness_velo = np.zeros((N, S),    dtype=np.float32)
+    sum_acti     = np.zeros((N, 4, S), dtype=np.float32)
+    sum_acti2    = np.zeros((N, 4, S), dtype=np.float32)
+    mean_gimb    = np.zeros(N,         dtype=np.float32)
     total_ticks  = 0
 
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']
@@ -232,6 +232,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # prenitialize values
     prev_delta = None
     time = 0
+
+    # hoisted loop constants
+    arangeS    = np.arange(S)
+    norm_const = np.array([1, 1, 2, 2], dtype=np.float32).reshape(1, 4, 1)
     while time < settings['limit']:
         # UPDATE PHYSICS
         state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
@@ -256,12 +260,12 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # have to do this weird shit to properly reference tickpos per trial
         # essentially ticks is a set of indexes referencing col num so we give it rows to align with its trial
         # so a tick of [2, 3] at row n means tick 2 (col 2) in trial 0 (row 0), [0, 2]; and next would be coord [1, 3]
-        target = tick_pos[np.arange(S), ticks]
+        target = tick_pos[arangeS, ticks]
 
         delta_world   = target - state_matrix[:, 0, :]
         delta  = delta_world * np.exp(-1j * state_matrix[:, 2, :].real)
         if prev_delta is None:
-            prev_delta = delta.copy()
+            prev_delta = delta
         # velocity
         vel = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
         # angles
@@ -279,7 +283,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
             t1_ang, t2_ang
         ], axis=1) # have to have 3 dim for forward pass (N, inputs, S)
 
-        prev_delta = delta.copy()
+        prev_delta = delta
 
         # FORWARD PASS OBSERVATIONS --------------------------------------------------------
         action_matrix = Brain.forward(obs)
@@ -292,7 +296,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # FITNESS CALULATIONS --------------------------------------------------------------
         # vratio fitness component (error form, hover-safe):
         prev_ticks = np.maximum(ticks - 1, 0)
-        target_prev = tick_pos[np.arange(S), prev_ticks]
+        target_prev = tick_pos[arangeS, prev_ticks]
         v_target = (target - target_prev) / dt
 
         # unit vector (direction) (N, S)
@@ -320,7 +324,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
-        normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
+        normalized = action_matrix / norm_const
         sum_acti += normalized       # (N, 4, S)
         sum_acti2 += normalized ** 2 # (N, 4, S)
         mean_gimb += ((np.abs(state_matrix[:, 4, :]) + np.abs(state_matrix[:, 5, :])) / 2).mean(axis=1) # (N, )
