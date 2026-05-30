@@ -124,18 +124,21 @@ def iso(archive: Archive, qty) -> list[Individual]:
     return children
 
 class cma():
-    def __init__(self, sigma=0.1) -> None:
-        self.sigma = sigma
+    def __init__(self, step_norm=0.4) -> None:
+        # target aggregate displacement of a sample from the seed; per-dim sigma
+        # is derived from this and the genome dimension at reset, so the spread
+        # stays constant regardless of network size (sigma = step_norm / sqrt(n)).
+        self.step_norm = step_norm
+        self.sigma = step_norm
 
         # dummy variables
         self.n_weights = 0
-        self.cma     = SepCMA(mean=np.zeros(2), sigma=sigma)
+        self.cma     = SepCMA(mean=np.zeros(2), sigma=self.sigma)
         self.pop     = np.inf
 
         self.buffer  = []
-        self.best    = -np.inf
-        self.stag    = 0
         self.restart = True
+        self.restart_reason = 'init'
 
 
     def ask(self, archive: Archive, qty) -> list[Individual]:
@@ -160,39 +163,40 @@ class cma():
             assert i.fitness is not None, 'fitness is None in cma.tell'
             self.buffer.append((g, i.fitness))
 
-        while len(self.buffer) >= self.pop:
-            batch, self.buffer = self.buffer[:self.pop] , self.buffer[self.pop:]
+        if len(self.buffer) >= self.pop:
+            # take one population; sampling order is fitness-independent so the
+            # first pop is an unbiased draw. discard the rest: any leftover was
+            # sampled from this same pre-tell distribution and would be stale
+            # against the updated mean/covariance on the next ask.
+            batch = self.buffer[:self.pop]
+            self.buffer = []
             self.cma.tell([(g, -f) for g, f in batch])
 
-            best = max(f for _, f in batch)
-            if best > self.best + 1e-4:
-                self.best = best
-                self.stag = 0
-            else:
-                self.stag += 1
-
-        if self.cma.should_stop() or self.stag > 15:
+        if self.cma.should_stop():
             self.restart = True
+            self.restart_reason = 'should_stop'
 
     def _reset(self, archive: Archive):
-        # calculate weights by improvement (for exploitation)
-        Temp = 0.9
-        w = archive.fit.copy()
-        w_stable = w - w[np.isfinite(w)].max()
-        probs = np.exp(w_stable / Temp).ravel()
-        probs[archive.fit.ravel() == -np.inf] = 0.0
-        assert probs.sum() > 0
-        probs /= probs.sum()
+        chosen: Individual = self._select_seed(archive)
 
-        chosen_idx = np.random.choice(probs.size, p=probs)   # choose idx based on weight
-        r, c = np.unravel_index(chosen_idx, shape=w.shape) # turn flat idx to matrix coord
-        chosen: Individual = archive.indv[r, c] # type: ignore
-
-        # create new cma instance
+        # create new cma instance; scale per-dim sigma to genome dimension
         base = np.concat([chosen.weights, chosen.biases])
+        self.sigma  = self.step_norm / np.sqrt(len(base))
         self.cma    = SepCMA(mean=base, sigma=self.sigma)
-        self.best   = -np.inf
         self.buffer = []
-        self.stag   = 0
         self.pop    = self.cma.population_size
         self.n_weights = len(chosen.weights)
+
+    def _select_seed(self, archive):
+        # seed from a uniform pick among the top-k elites (exploit the frontier)
+        fit = archive.fit.ravel()
+        occupied = np.flatnonzero(np.isfinite(fit))
+        assert occupied.size > 0
+        k = min(10, occupied.size)
+        top_k = occupied[np.argsort(fit[occupied])[-k:]]
+        chosen_idx = np.random.choice(top_k)
+        r, c = np.unravel_index(chosen_idx, shape=archive.fit.shape) # turn flat idx to matrix coord
+        chosen: Individual = archive.indv[r, c] # type: ignore
+
+        print(f"[cma reset] reason={self.restart_reason} elite=({r},{c}) fit={chosen.fitness:.3f}", flush=True)
+        return chosen

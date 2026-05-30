@@ -32,7 +32,7 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(0.02 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(0.05 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value
@@ -143,6 +143,7 @@ class algorithm():
         self.archive.curi_decay = 0.1 ** (8/self.batch_size) # curiosity decay factor
 
         stats = {'discoveries': 0, 'updates': 0, 'bandit_score': bandit_score}
+        max_contrib = 0.0  # biggest single-individual contribution this batch
         for i in individuals:
             idx, idy = self.archive.coordinates(i)
             was_empty = self.archive.fit[idx, idy] == -np.inf
@@ -157,10 +158,22 @@ class algorithm():
 
                 if i.tag in bandit_score:
                     old_fit = i.fitness - delta
-                    bandit_score[i.tag] += i.fitness**2 - max(old_fit, 0.0)**2
+                    contrib = i.fitness**2 - max(old_fit, 0.0)**2
+                    bandit_score[i.tag] += contrib
+                    max_contrib = max(max_contrib, contrib)
 
         # update cma
         self.cma.tell(individuals)
+
+        # normalize each individual's reward to [0, 1] by the batch's single
+        # best contribution, NOT by the arm totals. dividing by max_contrib (one
+        # individual) keeps each arm's score a sum of per-pull rewards, so the
+        # MAB's later score/pulls lands in [0, 1] instead of being squashed by
+        # the batch budget. the unchanged fitness**2 formula still makes
+        # high-fitness refinement worth more, and volume is preserved.
+        if max_contrib > 0:
+            for k in bandit_score:
+                bandit_score[k] /= max_contrib
 
         # update the bandit
         if self.gen > 0:
