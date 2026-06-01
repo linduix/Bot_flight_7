@@ -44,7 +44,7 @@ def show_archive(alg):
 save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
 
 RESOLUTION = 10
-MAX_LENGTH = 50
+MAX_LENGTH = 75
 
 if __name__=='__main__':
     # load save
@@ -144,7 +144,7 @@ if __name__=='__main__':
 
                         finite = alg.archive.fit[np.isfinite(alg.archive.fit)]
                         top10 = np.sort(finite)[-10:].mean() if finite.size >= 10 else (finite.mean() if finite.size else 0.0)
-                        
+
                         print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
                     top10_old = top10
 

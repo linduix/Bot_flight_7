@@ -124,6 +124,12 @@ def iso(archive: Archive, qty) -> list[Individual]:
     return children
 
 class cma():
+    # class-level defaults so checkpoints pickled before these fields existed
+    # fall back to them on unpickle (instance __dict__ is restored, __init__ is
+    # not called). lets old MAP_Checkpoint.pkl resume without migration.
+    step_norm = 0.4
+    restart_reason = 'init'
+
     def __init__(self, step_norm=0.4) -> None:
         # target aggregate displacement of a sample from the seed; per-dim sigma
         # is derived from this and the genome dimension at reset, so the spread
