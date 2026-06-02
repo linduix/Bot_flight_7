@@ -198,24 +198,13 @@ class cma_fit():
         self.n_weights = len(chosen.weights)
 
     def _select_seed(self, archive):
-        # seed from a uniform pick among the top-k elites (exploit the frontier)
-        fit = archive.fit.ravel()
-        occupied = np.flatnonzero(np.isfinite(fit))
-        assert occupied.size > 0
-        k = min(10, occupied.size)
-        top_k = occupied[np.argsort(fit[occupied])[-k:]]
-        chosen_idx = np.random.choice(top_k)
-        r, c = np.unravel_index(chosen_idx, shape=archive.fit.shape) # turn flat idx to matrix coord
+        # uniform pick among all occupied cells
+        occupied = np.argwhere(np.isfinite(archive.fit))
+        r, c = occupied[np.random.randint(len(occupied))]
         chosen: Individual = archive.indv[r, c] # type: ignore
 
         print(f"[cma reset] reason={self.restart_reason} elite=({r},{c}) fit={chosen.fitness:.3f}", flush=True)
         return chosen
-
-# backward-compat alias: old MAP_Checkpoint.pkl pickled this class as `arms.cma`
-# (and stored a bound `self.cma.ask` in the arms dict). pickle resolves classes by
-# qualified name at load time, so this name MUST keep resolving or load() crashes
-# before any migration code can run. keep until all live checkpoints are migrated.
-cma = cma_fit
 
 class cma_improv(cma_fit):
     tag = 'cma_improv'
