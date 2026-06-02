@@ -1,0 +1,5 @@
+# TODO
+
+- **Network inputs**: missile-style guidance features — swap `delta_dist`, `vel`, `old_vel` for `dir` (unit vector to target), `los_rate` (line-of-sight rotation rate), `tti` (time-to-intercept), `delta_tti`, and `integrated_dir`. Adjust input count and downstream layer sizes accordingly.
+- **Scale-invariant inputs**: make all network inputs scale-invariant so the controller generalizes across spawn distances and chain lengths without retraining.
+- **Adaptive homing reward (research)**: investigate a two-phase hybrid policy — violent predator dive from long range, smooth transition to a glued shadow at touch — merged by a TTI-driven sigmoid blend (no hard distance cliffs). Predator phase rewards intercept geometry (ZEM, closing speed); shadow phase rewards velocity matching and drift elimination. Reference: Proportional Navigation with Adaptive Terminal Guidance literature.

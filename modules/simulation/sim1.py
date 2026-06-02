@@ -216,6 +216,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     toggle  = np.zeros((N, S), dtype=bool) # tracks initial touch to start chain
     ticks   = np.zeros((N, S), dtype=int) # ticks since touched
 
+    # drone memory arrays
+    old_tti         = np.zeros((N, S), dtype=float)
+    integrated_dir  = np.zeros((N, S), dtype=float)
+
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
     fitness_velo = np.zeros((N, S),    dtype=np.float32)
@@ -249,12 +253,13 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
         # MAKE OBSERVATION ARRAY -----------------------------------------------------------
         # obs values:
-        #  1. delta pos x,  2. delta pos y
-        #  3. old delta x,  4. old delta y
-        #  5. velocity x,   6. volocity y
-        #  7. sin(angle),   8. cos(angle)
-        #  9. ang velocity
-        # 10. t1 angle,    11. t2 angle
+        #  1. dir x,  2. dir y
+        #  3. integrated dir x,  4. integrated dir y
+        #  5. tti,   6. tti derivative
+        #  7. los rate
+        #  8. sin(angle),   9. cos(angle)
+        # 10. ang velocity
+        # 11. t1 angle,    12. t2 angle
 
         # deltas
         # have to do this weird shit to properly reference tickpos per trial
