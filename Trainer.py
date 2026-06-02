@@ -19,10 +19,13 @@ def show_archive(alg):
     extent   = [alg.archive.xrange[0], alg.archive.xrange[1],
                 alg.archive.yrange[0], alg.archive.yrange[1]]
 
+    fail_success = np.log10((alg.archive.failed + 1) / (alg.archive.successes + 1))
+
     panels = [
         ('fitness',       alg.archive.fit,  'viridis'),
         ('log curiosity', alg.archive.curi, 'magma'),
         ('improvement',   alg.archive.impr, 'plasma'),
+        ('fail/success',  fail_success,     'inferno'),
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(9, 9))
@@ -35,7 +38,6 @@ def show_archive(alg):
         ax.set_xlabel('mean gimbal angle (rad)')
         ax.set_ylabel('activation variance')
         ax.set_title(f'{label} — gen {alg.gen}')
-    axes[3].axis('off')
 
     plt.subplots_adjust(left=0.08, right=0.96, top=0.93, bottom=0.08, hspace=0.45, wspace=0.3)
     plt.savefig('archive_heatmap.png', dpi=150)

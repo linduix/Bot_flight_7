@@ -7,7 +7,7 @@ import os
 
 class MAB():
     def __init__(self, arms: list[str]) -> None:
-        self.decay = 0.95
+        self.decay = 0.99
         self.total_pulls = 0
         self.arms = {}
         for k in arms:
@@ -64,9 +64,19 @@ class Archive():
         self.fit :    np.ndarray = np.full((res, res),  -np.inf)      # fitness matrix
         self.curi:    np.ndarray = np.full((res, res),  0.01000)      # curiosity matrix
         self.impr:    np.ndarray = np.full((res, res),  0.01000)      # fitness improvement matrix
-        self.updates: np.ndarray = np.full((res, res),  0)             # updates tracking matrix
+        self.failed:    np.ndarray = np.full((res, res), 0)            # failed-insert count per cell
+        self.successes: np.ndarray = np.full((res, res), 0)            # successful-insert count per cell (discovery + improvement)
 
         self.curi_decay = 0.99
+
+    def __setstate__(self, state):
+        # compat: pre-failure-rate checkpoints lack failed/successes matrices.
+        # backfill with zeros so resumed runs don't AttributeError.
+        self.__dict__.update(state)
+        if 'failed' not in state:
+            self.failed = np.zeros((self.res, self.res), dtype=int)
+        if 'successes' not in state:
+            self.successes = np.zeros((self.res, self.res), dtype=int)
 
     def coordinates(self, i: Individual) -> tuple[int, int]:
         # calculate the archive coordinates for individual
@@ -84,13 +94,15 @@ class Archive():
         old_fit = self.fit[idx, idy]
 
         if i.fitness <= old_fit:
+            self.failed[idx, idy] += 1
             if i.parent_idx is not None:
                 self.curi[i.parent_idx] = max(self.curi[i.parent_idx] * self.curi_decay, 0.01)
-            return 0.0
+            return cast(float, i.fitness - old_fit)
 
         # update the archivess
         self.fit[idx, idy]  =  i.fitness
         self.indv[idx, idy] =  i
+        self.successes[idx, idy] += 1
         if i.parent_idx is not None:
             self.curi[i.parent_idx] += 1
         if old_fit != -np.inf:
@@ -151,6 +163,7 @@ class algorithm():
             was_empty = self.archive.fit[idx, idy] == -np.inf
             delta = self.archive.insert(i)
             i.improv = delta
+            delta = max(delta, 0.0)
 
             # if successful update, reward bandit:
             if delta > 0:
@@ -334,10 +347,13 @@ if __name__ == "__main__":
     extent   = [alg.archive.xrange[0], alg.archive.xrange[1],
                 alg.archive.yrange[0], alg.archive.yrange[1]]
 
+    fail_success = np.log10((alg.archive.failed + 1) / (alg.archive.successes + 1))
+
     panels = [
-        ('fitness',       alg.archive.fit,          'viridis'),
-        ('log curiosity', alg.archive.curi,         'magma'),
-        ('improvement',   alg.archive.impr,         'plasma'),
+        ('fitness',       alg.archive.fit,  'viridis'),
+        ('log curiosity', alg.archive.curi, 'magma'),
+        ('improvement',   alg.archive.impr, 'plasma'),
+        ('fail/success',  fail_success,     'inferno'),
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 14))
@@ -350,7 +366,6 @@ if __name__ == "__main__":
         ax.set_xlabel('mean gimbal angle (rad)')
         ax.set_ylabel('activation variance')
         ax.set_title(f'{label} — gen {alg.gen} (final seed)')
-    axes[3].axis('off')
 
     plt.tight_layout()
     plt.savefig('archive_heatmap.png', dpi=150)

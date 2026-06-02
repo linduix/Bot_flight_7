@@ -50,8 +50,8 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
     state[:, 5, :] += rotation_speed * rot2 * dt
     # ADD ROTATION CLIPPING
     max_angle = np.deg2rad(drone_conf['th_max_angle'])
-    state[:, 4, :] = np.clip(state[:, 4, :].real, -max_angle, max_angle)
-    state[:, 5, :] = np.clip(state[:, 5, :].real, -max_angle, max_angle)
+    state[:, 4, :] = np.clip(state[:, 4, :].real, -max_angle, max_angle) # type:ignore
+    state[:, 5, :] = np.clip(state[:, 5, :].real, -max_angle, max_angle) # type:ignore
 
     # THRUST
     # magnitude
@@ -269,10 +269,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # velocity
         vel = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
         # angles
-        angle   = state_matrix[:, 2, :].real
-        ang_vel = state_matrix[:, 3, :].real
-        t1_ang  = state_matrix[:, 4, :].real
-        t2_ang  = state_matrix[:, 5, :].real
+        angle   = state_matrix[:, 2, :].real # type:ignore
+        ang_vel = state_matrix[:, 3, :].real # type:ignore
+        t1_ang  = state_matrix[:, 4, :].real # type:ignore
+        t2_ang  = state_matrix[:, 5, :].real # type:ignore
 
         obs = np.stack([
             delta.real, delta.imag,
@@ -307,8 +307,12 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         v_drn_par = (state_matrix[:, 1, :] * np.conj(u)).real
         # max safe approach velocity (N, S)
         safe_v    = np.sqrt(2 * max_a * (dist + eps_d))
-        # zero approach budget inside touch radius -> pure hover-match target
-        safe_v_term = np.where(dist > 0.5, safe_v, 0.0)
+        # smoothly taper the approach budget to 0 inside the touch radius. linear
+        # scale turns the sqrt profile into dist^1.5 near the target (zero slope at
+        # origin) -> no velocity-command cliff at 0.5 and no overshoot-inducing
+        # steep sqrt tangent right at the target. collapses to pure hover-match.
+        smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
+        safe_v_term = safe_v * smooth_scale
         # ideal along-u drone vel = match target motion + approach budget (N, S)
         ideal_par = v_tgt_par + safe_v_term
 
@@ -318,7 +322,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         scale = np.maximum(np.abs(ideal_par), floor)
         # inverted quadratic centered at err=0, mild negative for wrong-way ticks
         score = np.clip(1.0 - (err / scale) ** 2, -0.5, 1.0)
-        score = score / (1 + dist)
+        score = score / (1 + np.sqrt(dist))
 
         fitness_velo += dt * score # (N, S)
 

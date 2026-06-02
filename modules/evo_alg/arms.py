@@ -129,6 +129,7 @@ class cma_fit():
     # not called). lets old MAP_Checkpoint.pkl resume without migration.
     step_norm = 0.4
     restart_reason = 'init'
+    stagnation_count = 0
     tag = 'cma_fit'
 
     def __init__(self, step_norm=0.4) -> None:
@@ -146,6 +147,7 @@ class cma_fit():
         self.buffer  = []
         self.restart = True
         self.restart_reason = 'init'
+        self.stagnation_count = 0
 
 
     def ask(self, archive: Archive, qty) -> list[Individual]:
@@ -164,14 +166,14 @@ class cma_fit():
         return children
 
     def _add_to_buffer(self, individuals: list[Individual]):
-        filterd = [i for i in individuals if i.tag == self.tag]
-        for i in filterd:
+        for i in individuals:
             g = np.concatenate([i.weights, i.biases])
             assert i.fitness is not None, 'fitness is None in cma.tell'
             self.buffer.append((g, i.fitness))
 
     def tell(self, individuals: list[Individual]):
-        self._add_to_buffer(individuals)
+        own = [i for i in individuals if i.tag == self.tag and i.fitness is not None]
+        self._add_to_buffer(own)
 
         if len(self.buffer) >= self.pop:
             # take one population; sampling order is fitness-independent so the
@@ -185,6 +187,18 @@ class cma_fit():
         if self.cma.should_stop():
             self.restart = True
             self.restart_reason = 'should_stop'
+
+        # stagnation restart: 15 consecutive gens with mean child fitness < 0.01
+        if own:
+            mean_fit = float(np.mean([i.fitness for i in own])) # type:ignore
+            if mean_fit < 0.01:
+                self.stagnation_count += 1
+            else:
+                self.stagnation_count = 0
+            if self.stagnation_count >= 15:
+                self.restart = True
+                self.restart_reason = 'stagnation'
+                self.stagnation_count = 0
 
     def _reset(self, archive: Archive):
         chosen: Individual = self._select_seed(archive)
@@ -213,8 +227,6 @@ class cma_improv(cma_fit):
         super().__init__(step_norm)
 
     def _add_to_buffer(self, individuals: list[Individual]):
-        filterd = [i for i in individuals if (i.tag == self.tag and i.improv is not None)]
-        for i in filterd:
+        for i in individuals:
             g = np.concatenate([i.weights, i.biases])
-            assert i.improv is not None, 'improv is None in cma.tell'
             self.buffer.append((g, i.improv))

@@ -106,7 +106,7 @@ class ParticlePool:
         alive = np.where(self.life > 0)[0]
         for i in alive:
             alpha = int(self.start_alpha[i] * self.life[i] / self.max_life[i])
-            sx, sy = world_to_screen(self.pos[i])
+            sx, sy = world_to_screen(self.pos[i]) # type:ignore
             surf = pg.Surface((radius * 2, radius * 2), pg.SRCALPHA)
             pg.draw.circle(surf, (255, 150, 50, alpha), (radius, radius), radius)
             screen.blit(surf, (sx - radius, sy - radius))
@@ -159,7 +159,7 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     else:
         featured = set(featured)
     if featured and all(fits[i] is not None for i in featured):
-        highlight = max(featured, key=lambda i: fits[i])
+        highlight = max(featured, key=lambda i: fits[i]) # type:ignore
     elif featured:
         highlight = int(np.random.choice(list(featured)))
     else:
@@ -251,10 +251,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         if prev_delta is None:
             prev_delta = delta.copy()
         vel     = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
-        angle   = state_matrix[:, 2, :].real
-        ang_vel = state_matrix[:, 3, :].real
-        t1_ang  = state_matrix[:, 4, :].real
-        t2_ang  = state_matrix[:, 5, :].real
+        angle   = state_matrix[:, 2, :].real # type:ignore
+        ang_vel = state_matrix[:, 3, :].real # type:ignore
+        t1_ang  = state_matrix[:, 4, :].real # type:ignore
+        t2_ang  = state_matrix[:, 5, :].real # type:ignore
 
         obs = np.stack([
             delta.real, delta.imag,
