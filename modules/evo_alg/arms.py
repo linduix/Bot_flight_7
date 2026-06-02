@@ -123,12 +123,13 @@ def iso(archive: Archive, qty) -> list[Individual]:
 
     return children
 
-class cma():
+class cma_fit():
     # class-level defaults so checkpoints pickled before these fields existed
     # fall back to them on unpickle (instance __dict__ is restored, __init__ is
     # not called). lets old MAP_Checkpoint.pkl resume without migration.
     step_norm = 0.4
     restart_reason = 'init'
+    tag = 'cma_fit'
 
     def __init__(self, step_norm=0.4) -> None:
         # target aggregate displacement of a sample from the seed; per-dim sigma
@@ -157,24 +158,27 @@ class cma():
             g = self.cma.ask()
             w = g[:self.n_weights].astype(np.float32)
             b = g[self.n_weights:].astype(np.float32)
-            child = Individual('cma', w, b, None)
+            child = Individual(self.tag, w, b, None)
             children.append(child)
 
         return children
 
-    def tell(self, individuals: list[Individual]):
-        filterd = [i for i in individuals if i.tag == 'cma']
+    def _add_to_buffer(self, individuals: list[Individual]):
+        filterd = [i for i in individuals if i.tag == self.tag]
         for i in filterd:
             g = np.concatenate([i.weights, i.biases])
             assert i.fitness is not None, 'fitness is None in cma.tell'
             self.buffer.append((g, i.fitness))
+
+    def tell(self, individuals: list[Individual]):
+        self._add_to_buffer(individuals)
 
         if len(self.buffer) >= self.pop:
             # take one population; sampling order is fitness-independent so the
             # first pop is an unbiased draw. discard the rest: any leftover was
             # sampled from this same pre-tell distribution and would be stale
             # against the updated mean/covariance on the next ask.
-            batch = self.buffer[:self.pop]
+            batch = self.buffer[:self.pop] #type:ignore
             self.buffer = []
             self.cma.tell([(g, -f) for g, f in batch])
 
@@ -206,3 +210,22 @@ class cma():
 
         print(f"[cma reset] reason={self.restart_reason} elite=({r},{c}) fit={chosen.fitness:.3f}", flush=True)
         return chosen
+
+# backward-compat alias: old MAP_Checkpoint.pkl pickled this class as `arms.cma`
+# (and stored a bound `self.cma.ask` in the arms dict). pickle resolves classes by
+# qualified name at load time, so this name MUST keep resolving or load() crashes
+# before any migration code can run. keep until all live checkpoints are migrated.
+cma = cma_fit
+
+class cma_improv(cma_fit):
+    tag = 'cma_improv'
+
+    def __init__(self, step_norm=0.4) -> None:
+        super().__init__(step_norm)
+
+    def _add_to_buffer(self, individuals: list[Individual]):
+        filterd = [i for i in individuals if (i.tag == self.tag and i.improv is not None)]
+        for i in filterd:
+            g = np.concatenate([i.weights, i.biases])
+            assert i.improv is not None, 'improv is None in cma.tell'
+            self.buffer.append((g, i.improv))

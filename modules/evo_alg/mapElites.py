@@ -96,7 +96,7 @@ class Archive():
         if old_fit != -np.inf:
             self.impr[idx, idy] += i.fitness - old_fit
 
-        return i.fitness - old_fit if old_fit != -np.inf else i.fitness
+        return cast(float, i.fitness - old_fit if old_fit != -np.inf else i.fitness)
 
     def get(self, row: int, col: int) -> Individual:
         return cast(Individual, self.indv[row, col])
@@ -109,13 +109,15 @@ class algorithm():
     def __init__(self, resolution) -> None:
         self.gen = 0
         self.archive = Archive(resolution)
-        self.cma = arms.cma()
+        self.cma_fit = arms.cma_fit()
+        self.cma_improv = arms.cma_improv()
 
         self.arms: dict['str', Callable[[Archive, int], list[Individual]]] = {
             'random'  : arms.random,
             'gaussian': arms.gaussian,
             'iso'     : arms.iso,
-            'cma'     : self.cma.ask
+            'cma_fit' : self.cma_fit.ask,
+            'cma_improv' : self.cma_improv.ask
         }
         self.bandit = MAB(list(self.arms.keys()))
 
@@ -148,6 +150,7 @@ class algorithm():
             idx, idy = self.archive.coordinates(i)
             was_empty = self.archive.fit[idx, idy] == -np.inf
             delta = self.archive.insert(i)
+            i.improv = delta
 
             # if successful update, reward bandit:
             if delta > 0:
@@ -157,13 +160,14 @@ class algorithm():
                     stats['updates'] += 1
 
                 if i.tag in bandit_score:
-                    old_fit = i.fitness - delta
-                    contrib = i.fitness**2 - max(old_fit, 0.0)**2
+                    old_fit = i.fitness - delta                   # type:ignore
+                    contrib = i.fitness**2 - max(old_fit, 0.0)**2 # type:ignore
                     bandit_score[i.tag] += contrib
                     max_contrib = max(max_contrib, contrib)
 
         # update cma
-        self.cma.tell(individuals)
+        self.cma_fit.tell(individuals)
+        self.cma_improv.tell(individuals)
 
         # normalize each individual's reward to [0, 1] by the batch's single
         # best contribution, NOT by the arm totals. dividing by max_contrib (one
@@ -197,8 +201,10 @@ class algorithm():
         self.archive = Archive(resoulution)
 
         self.bandit      = MAB(list(self.arms.keys()))
-        self.cma         = arms.cma()
-        self.arms['cma'] = self.cma.ask
+        self.cma_fit = arms.cma_fit()
+        self.cma_improv = arms.cma_improv()
+        self.arms['cma_fit'] = self.cma_fit.ask
+        self.arms['cma_improv'] = self.cma_improv.ask
 
         for i in initial_pop:
             i.parent_idx = None

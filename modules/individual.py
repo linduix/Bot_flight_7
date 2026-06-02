@@ -10,4 +10,4 @@ class Individual:
     fitness:     float|None = None
     descriptors: dict       = field(default_factory=dict)
     stats:       list|None  = None
-
+    improv:      float|None = None
