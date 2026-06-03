@@ -303,8 +303,6 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         u         = delta_world / (dist + eps)
         # target vel projected onto approach direction (N, S)
         v_tgt_par = (v_target * np.conj(u)).real
-        # drone vel projected onto approach direction (N, S)
-        v_drn_par = (state_matrix[:, 1, :] * np.conj(u)).real
         # max safe approach velocity (N, S)
         safe_v    = np.sqrt(2 * max_a * (dist + eps_d))
         # smoothly taper the approach budget to 0 inside the touch radius. linear
@@ -313,12 +311,19 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # steep sqrt tangent right at the target. collapses to pure hover-match.
         smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
         safe_v_term = safe_v * smooth_scale
-        # ideal along-u drone vel = match target motion + approach budget (N, S)
-        ideal_par = v_tgt_par + safe_v_term
+        # ideal drone vel VECTOR = match target motion + approach budget along u.
+        # approach budget is purely along u (toward target); perpendicular ideal is
+        # just the target's lateral drift, so the vector form scores it for free.
+        ideal_vel = v_target + safe_v_term * u
 
-        # error between drone and ideal along-u vel (N, S)
-        err   = v_drn_par - ideal_par
-        # tolerance, floored so hover (ideal=0) doesnt explode (N, S)
+        # full 2D velocity error magnitude (N, S). expands to sqrt(par_err^2 +
+        # perp_err^2): the parallel piece is identical to the old projection form,
+        # the perpendicular piece penalizes orbiting / lateral drift beyond target.
+        err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
+        # tolerance from the parallel ideal magnitude, floored so hover (ideal=0)
+        # doesnt explode (N, S). large during fast approach -> lenient on lateral
+        # velocity; floors at hover -> tight, so orbiting is punished where it hurts.
+        ideal_par = v_tgt_par + safe_v_term
         scale = np.maximum(np.abs(ideal_par), floor)
         # inverted quadratic centered at err=0, mild negative for wrong-way ticks
         score = np.clip(1.0 - (err / scale) ** 2, -0.5, 1.0)

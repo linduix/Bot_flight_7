@@ -214,10 +214,10 @@ class algorithm():
         self.archive = Archive(resoulution)
 
         self.bandit      = MAB(list(self.arms.keys()))
-        self.cma_fit = arms.cma_fit()
-        self.cma_improv = arms.cma_improv()
-        self.arms['cma_fit'] = self.cma_fit.ask
-        self.arms['cma_improv'] = self.cma_improv.ask
+        # keep the CMA arms across curriculum transitions: their mean+covariance
+        # live in genome space (network topology is unchanged between stages), so
+        # the learned distribution is still valid progress. rebuilding them here
+        # would discard it and force a cold re-seed every transition.
 
         for i in initial_pop:
             i.parent_idx = None
