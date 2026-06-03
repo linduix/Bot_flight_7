@@ -292,7 +292,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # closest approach distance m (project target distance onto relative velocity)
         closest_approach = (delta_local * np.conjugate(rel_vel)).real / (np.abs(rel_vel) + eps)
         # time to intercept
-        tti = np.clip(closest_approach / (np.abs(rel_vel) + eps), -5.0, 5.0)
+        tti = np.clip(closest_approach / (np.abs(rel_vel) + eps), -1.0, 1.0)
 
         # zero effort miss (how far it will miss target if it just coasts to target)
         # zem = target position - projected drone position - gravity correction
