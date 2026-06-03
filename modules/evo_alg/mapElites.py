@@ -55,8 +55,8 @@ class MAB():
 class Archive():
     def __init__(self, res) -> None:
         # descriptor minmax; x: mean gimble angle, y: activation variance
-        self.xrange: tuple = (0.20, 0.75)
-        self.yrange: tuple = (0.02, 0.25)
+        self.xrange: tuple = (0.20, .9)
+        self.yrange: tuple = (0.00, 0.25)
 
         # archive matrices
         self.res  = res
@@ -174,13 +174,19 @@ class algorithm():
 
                 if i.tag in bandit_score:
                     old_fit = i.fitness - delta                   # type:ignore
-                    contrib = i.fitness**2 - max(old_fit, 0.0)**2 # type:ignore
+                    if old_fit < 0:
+                        # occupant is negative: shift both up by -old_fit so the
+                        # occupant sits at 0 and the candidate sits at its improvement.
+                        # keeps contrib positive + monotonic while climbing out of negatives.
+                        contrib = (i.fitness - old_fit)**2        # type:ignore
+                    else:
+                        contrib = i.fitness**2 - old_fit**2       # type:ignore
                     bandit_score[i.tag] += contrib
                     max_contrib = max(max_contrib, contrib)
 
         # update cma
-        self.cma_fit.tell(individuals)
-        self.cma_improv.tell(individuals)
+        self.cma_fit.tell(individuals, self.archive)
+        self.cma_improv.tell(individuals, self.archive)
 
         # normalize each individual's reward to [0, 1] by the batch's single
         # best contribution, NOT by the arm totals. dividing by max_contrib (one

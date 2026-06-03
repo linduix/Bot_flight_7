@@ -5,7 +5,8 @@
       "WebSearch",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:ar5iv.labs.arxiv.org)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(python -m py_compile modules/simulation/sim1.py modules/evo_alg/arms.py modules/evo_alg/mapElites.py)"
     ]
   }
 }

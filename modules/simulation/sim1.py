@@ -216,15 +216,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     toggle  = np.zeros((N, S), dtype=bool) # tracks initial touch to start chain
     ticks   = np.zeros((N, S), dtype=int) # ticks since touched
 
-    # drone memory arrays
-    old_tti         = np.zeros((N, S), dtype=float)
-    integrated_dir  = np.zeros((N, S), dtype=float)
-
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
     fitness_velo = np.zeros((N, S),    dtype=np.float32)
-    sum_acti     = np.zeros((N, 4, S), dtype=np.float32)
     sum_acti2    = np.zeros((N, 4, S), dtype=np.float32)
+    sum_acti     = np.zeros((N, 4, S), dtype=np.float32)
     mean_gimb    = np.zeros(N,         dtype=np.float32)
     total_ticks  = 0
 
@@ -234,7 +230,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     floor = 0.5   # hover tolerance, m/s
     
     # prenitialize values
-    prev_delta = None
+    prev_los   = None
     time = 0
 
     # hoisted loop constants
@@ -252,62 +248,86 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         state_matrix[:, 3, :] += w_kick
 
         # MAKE OBSERVATION ARRAY -----------------------------------------------------------
-        # obs values:
-        #  1. dir x,  2. dir y
-        #  3. integrated dir x,  4. integrated dir y
-        #  5. tti,   6. tti derivative
-        #  7. los rate
-        #  8. sin(angle),   9. cos(angle)
-        # 10. ang velocity
-        # 11. t1 angle,    12. t2 angle
+        # obs values (predictive GNC set, fully Markov):
+        #  1. zem x,        2. zem y
+        #  3. zev x,        4. zev y
+        #  5. los rate
+        #  6. sin(angle),   7. cos(angle)
+        #  8. ang velocity
+        #  9. t1 angle,    10. t2 angle
 
         # deltas
         # have to do this weird shit to properly reference tickpos per trial
         # essentially ticks is a set of indexes referencing col num so we give it rows to align with its trial
         # so a tick of [2, 3] at row n means tick 2 (col 2) in trial 0 (row 0), [0, 2]; and next would be coord [1, 3]
-        target = tick_pos[arangeS, ticks]
+        angle        = state_matrix[:, 2, :].real # type:ignore
+        target       = tick_pos[arangeS, ticks]
+        delta_world  = target - state_matrix[:, 0, :]
+        delta_local  = delta_world * np.exp(-1j * angle)
 
-        delta_world   = target - state_matrix[:, 0, :]
-        delta  = delta_world * np.exp(-1j * state_matrix[:, 2, :].real)
-        if prev_delta is None:
-            prev_delta = delta
+        # obs foundational calc
+        # distance (magnitude) (N, S)
+        dist = np.abs(delta_world)
+        # los unit vector (direction) (N, S)
+        los_u  = delta_world / (dist + eps)
+
+        if prev_los is None:
+            prev_los = los_u
+
+        # los rate rads/s (N, S)
+        los_rate = np.angle(los_u / prev_los) / dt
+        prev_los = los_u
+
         # velocity
-        vel = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
+        vel = state_matrix[:, 1, :] * np.exp(-1j * angle)
+
+        # target prev loc
+        prev_ticks  = np.maximum(ticks - 1, 0)
+        target_prev = tick_pos[arangeS, prev_ticks]
+        # target vel estimate
+        v_target = (target - target_prev) / dt
+        v_target_local = v_target * np.exp(-1j * angle)
+        rel_vel = vel - v_target_local
+
+        # closest approach distance m (project target distance onto relative velocity)
+        closest_approach = (delta_local * np.conjugate(rel_vel)).real / (np.abs(rel_vel) + eps)
+        # time to intercept
+        tti = np.clip(closest_approach / (np.abs(rel_vel) + eps), -5.0, 5.0)
+
+        # zero effort miss (how far it will miss target if it just coasts to target)
+        # zem = target position - projected drone position - gravity correction
+        zem = delta_local - (rel_vel * tti) + (0.5 * -9.81j * np.exp(-1j * angle) * (tti ** 2))
+
+        # zero effor velocity (velocity matching after coasting till tti)
+        # zev = v target - projected v drone - gravity correction
+        zev = v_target_local - vel + -9.81j * np.exp(-1j * angle) * tti
+
         # angles
-        angle   = state_matrix[:, 2, :].real # type:ignore
         ang_vel = state_matrix[:, 3, :].real # type:ignore
         t1_ang  = state_matrix[:, 4, :].real # type:ignore
         t2_ang  = state_matrix[:, 5, :].real # type:ignore
 
         obs = np.stack([
-            delta.real, delta.imag,
-            prev_delta.real, prev_delta.imag,
-            vel.real, vel.imag,
+            zem.real, zem.imag,
+            zev.real, zev.imag,
+            los_rate,
             np.sin(angle), np.cos(angle),
             ang_vel,
             t1_ang, t2_ang
         ], axis=1) # have to have 3 dim for forward pass (N, inputs, S)
-
-        prev_delta = delta
 
         # FORWARD PASS OBSERVATIONS --------------------------------------------------------
         action_matrix = Brain.forward(obs)
 
         # PROGRESS SIMULATION --------------------------------------------------------------
         # check if touched waypoint
-        dist = np.abs(delta_world)
         toggle |= dist < 0.5
 
         # FITNESS CALULATIONS --------------------------------------------------------------
         # vratio fitness component (error form, hover-safe):
-        prev_ticks = np.maximum(ticks - 1, 0)
-        target_prev = tick_pos[arangeS, prev_ticks]
-        v_target = (target - target_prev) / dt
 
-        # unit vector (direction) (N, S)
-        u         = delta_world / (dist + eps)
         # target vel projected onto approach direction (N, S)
-        v_tgt_par = (v_target * np.conj(u)).real
+        v_tgt_par = (v_target * np.conj(los_u)).real
         # max safe approach velocity (N, S)
         safe_v    = np.sqrt(2 * max_a * (dist + eps_d))
         # smoothly taper the approach budget to 0 inside the touch radius. linear
@@ -315,11 +335,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # origin) -> no velocity-command cliff at 0.5 and no overshoot-inducing
         # steep sqrt tangent right at the target. collapses to pure hover-match.
         smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
-        safe_v_term = safe_v * smooth_scale
-        # ideal drone vel VECTOR = match target motion + approach budget along u.
-        # approach budget is purely along u (toward target); perpendicular ideal is
+        safe_v_term  = safe_v * smooth_scale
+        # ideal drone vel VECTOR = match target motion + approach budget along los_u.
+        # approach budget is purely along los_u (toward target); perpendicular ideal is
         # just the target's lateral drift, so the vector form scores it for free.
-        ideal_vel = v_target + safe_v_term * u
+        ideal_vel = v_target + safe_v_term * los_u
 
         # full 2D velocity error magnitude (N, S). expands to sqrt(par_err^2 +
         # perp_err^2): the parallel piece is identical to the old projection form,
@@ -354,8 +374,9 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     var_acti = var_acti.mean(axis=(1, 2)) # (N, )
     mean_gimb = mean_gimb / total_ticks   # (N, )
 
-    # floor whole-episode fitness at 0, negatives within episode still shape gradient
-    fitness = np.maximum(fitness_velo, 0.0)
+    # keep raw fitness (incl. negatives) so the archive has a gradient to climb;
+    # empty cells are -inf and contrib handles negative occupants.
+    fitness = fitness_velo
 
     top_idx = fitness.mean(axis=1).argsort()[-5:]
     top = fitness[top_idx, :]
@@ -402,7 +423,7 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     stats['fit_mean'] /= cpus
     stats['fit_velo'] /= cpus
 
-    # print(f'fitness, {stats['fit_velo']:.2f}, {stats['fit_mean']:.2f}')
+    print(f"fitness, {stats['fit_velo']:.2f}, {stats['fit_mean']:.2f}")
 
     return scored, stats
 

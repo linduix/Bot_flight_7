@@ -133,7 +133,7 @@ if __name__=='__main__':
 
                 # pool transition branch:
                 if alg.gen % 50 == 0:
-                    if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.01:
+                    if top10_old != 0 and (top10 - top10_old) / abs(top10_old) < 0.01 and top10 > 0:
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05

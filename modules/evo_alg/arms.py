@@ -129,7 +129,7 @@ class cma_fit():
     # not called). lets old MAP_Checkpoint.pkl resume without migration.
     step_norm = 0.4
     restart_reason = 'init'
-    stagnation_count = 0
+    lag_count = 0
     tag = 'cma_fit'
 
     def __init__(self, step_norm=0.4) -> None:
@@ -147,7 +147,7 @@ class cma_fit():
         self.buffer  = []
         self.restart = True
         self.restart_reason = 'init'
-        self.stagnation_count = 0
+        self.lag_count = 0
 
 
     def ask(self, archive: Archive, qty) -> list[Individual]:
@@ -171,7 +171,7 @@ class cma_fit():
             assert i.fitness is not None, 'fitness is None in cma.tell'
             self.buffer.append((g, i.fitness))
 
-    def tell(self, individuals: list[Individual]):
+    def tell(self, individuals: list[Individual], archive: Archive):
         own = [i for i in individuals if i.tag == self.tag and i.fitness is not None]
         self._add_to_buffer(own)
 
@@ -188,17 +188,24 @@ class cma_fit():
             self.restart = True
             self.restart_reason = 'should_stop'
 
-        # stagnation restart: 15 consecutive gens with mean child fitness < 0.01
+        # stale-seed restart: the seed is anchored on an old base that the rest of
+        # the archive (iso/gaussian) has already surpassed. measured RELATIVE to the
+        # current archive: stale when the arm's mean children can't clear the 15th
+        # percentile of archive fitness for a window of gens. a still-competitive
+        # seed (even one improving slowly) never trips; true convergence -> should_stop.
         if own:
-            mean_fit = float(np.mean([i.fitness for i in own])) # type:ignore
-            if mean_fit < 0.01:
-                self.stagnation_count += 1
-            else:
-                self.stagnation_count = 0
-            if self.stagnation_count >= 15:
-                self.restart = True
-                self.restart_reason = 'stagnation'
-                self.stagnation_count = 0
+            finite = archive.fit[np.isfinite(archive.fit)]
+            if finite.size:
+                bar = np.quantile(finite, 0.15)
+                batch_mean = float(np.mean([i.fitness for i in own]))  # type:ignore
+                if batch_mean < bar:
+                    self.lag_count += 1
+                else:
+                    self.lag_count = 0
+                if self.lag_count >= 10:
+                    self.restart = True
+                    self.restart_reason = 'stale_seed'
+                    self.lag_count = 0
 
     def _reset(self, archive: Archive):
         chosen: Individual = self._select_seed(archive)
@@ -210,6 +217,7 @@ class cma_fit():
         self.buffer = []
         self.pop    = self.cma.population_size
         self.n_weights = len(chosen.weights)
+        self.lag_count = 0
 
     def _select_seed(self, archive):
         # uniform pick among all occupied cells
