@@ -290,7 +290,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         relvel_u   = rel_vel / (relvel_mag + eps)
 
         # --- prev-tick net acceleration (world -> local) ---
-        vel_world = state_matrix[:, 1, :]
+        vel_world = state_matrix[:, 1, :].copy()   # copy: state_matrix is mutated in place next tick
         if prev_vel is None:
             prev_vel = vel_world
         net_acc = ((vel_world - prev_vel) / dt) * np.exp(-1j * angle)
@@ -303,11 +303,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         tti_raw = closest_approach / (np.abs(rel_vel) + eps)
         tti_obs = np.tanh(tti_raw / 10.0)
 
-        # --- guidance accel commands (zem/zev projected 1s w/ gravity -> PN form, mag-capped) ---
-        horizon   = 1.0
+        # --- guidance accel commands: ZEM/ZEV at t_go = tti_raw w/ gravity -> PN form, mag-capped ---
         grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)  # world gravity -> body frame
-        zem = delta_local - rel_vel * horizon + 0.5 * grav_body * horizon ** 2
-        zev = v_target_local - vel + grav_body * horizon
+        zem = delta_local - rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2
+        zev = v_target_local - vel + grav_body * tti_raw
         zem_a = zem / (tti_raw ** 2 + eps)
         zev_a = zev / (tti_raw + eps)
         zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
