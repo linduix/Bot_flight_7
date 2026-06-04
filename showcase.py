@@ -92,6 +92,7 @@ def showcase(individuals, sector_coords, present, dt=1/60):
     label_font = pg.font.SysFont(None, 20)
 
     drone_conf = get_drone_conf(config_path)
+    max_a = 2 * drone_conf['th_force'] / drone_conf['M']   # control authority for zem_a/zev_a cap
     Brain = brain(individuals)
     N = len(individuals)
     S = 1  # one trial per drone in showcase mode
@@ -105,7 +106,9 @@ def showcase(individuals, sector_coords, present, dt=1/60):
     # init state matrix (N, 6, S)
     state_matrix  = np.zeros((N, 6, S), dtype=complex)
     action_matrix = np.zeros((N, 4, S), dtype=float)
-    prev_delta    = None
+    prev_los      = None
+    prev_target   = None
+    prev_vel      = None
 
     # distance after which we respawn a drone (offscreen)
     reset_dist = np.hypot(SCREEN_W, SCREEN_H) / METERS_TO_PIXELS
@@ -141,26 +144,78 @@ def showcase(individuals, sector_coords, present, dt=1/60):
                 state_matrix[i, :, :] = 0
                 state_matrix[i, 2, :] = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
 
-        # observations
+        # observations (27-input, mirrors sim1.py)
+        eps   = 1e-8
+        angle = state_matrix[:, 2, :].real
+
         delta_world = target - state_matrix[:, 0, :]
-        delta = delta_world * np.exp(-1j * state_matrix[:, 2, :].real)
-        if prev_delta is None:
-            prev_delta = delta.copy()
-        vel     = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
-        angle   = state_matrix[:, 2, :].real
-        ang_vel = state_matrix[:, 3, :].real
-        t1_ang  = state_matrix[:, 4, :].real
-        t2_ang  = state_matrix[:, 5, :].real
+        delta_local = delta_world * np.exp(-1j * angle)
+
+        # target geometry
+        dist  = np.abs(delta_world)
+        los_u = delta_world / (dist + eps)
+        los_local = delta_local / (dist + eps)
+        if prev_los is None:
+            prev_los = los_u
+        # los rate in LOCAL frame = inertial los rate - drone angular velocity
+        los_rate = np.tanh((np.angle(los_u / prev_los) / dt - state_matrix[:, 3, :].real) / 3.0)
+        prev_los = los_u
+
+        # self velocity (local)
+        vel = state_matrix[:, 1, :] * np.exp(-1j * angle)
+        vel_mag = np.abs(vel); vel_u = vel / (vel_mag + eps)
+
+        # relative velocity (local), target vel from frame-to-frame mouse motion
+        if prev_target is None:
+            prev_target = target
+        v_target = (target - prev_target) / dt
+        prev_target = target
+        v_target_local = v_target * np.exp(-1j * angle)
+        rel_vel = vel - v_target_local
+        relvel_mag = np.abs(rel_vel); relvel_u = rel_vel / (relvel_mag + eps)
+
+        # prev-tick net acceleration (world -> local)
+        vel_world = state_matrix[:, 1, :]
+        if prev_vel is None:
+            prev_vel = vel_world
+        net_acc = ((vel_world - prev_vel) / dt) * np.exp(-1j * angle)
+        prev_vel = vel_world
+        acc_mag = np.abs(net_acc); acc_u = net_acc / (acc_mag + eps)
+
+        # time to closest approach
+        closest_approach = (delta_local * np.conjugate(rel_vel)).real / (np.abs(rel_vel) + eps)
+        tti_raw = closest_approach / (np.abs(rel_vel) + eps)
+        tti_obs = np.tanh(tti_raw / 10.0)
+
+        # guidance accel commands (PN form, mag-capped to max_a via tanh)
+        horizon   = 1.0
+        grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)
+        zem = delta_local - rel_vel * horizon + 0.5 * grav_body * horizon ** 2
+        zev = v_target_local - vel + grav_body * horizon
+        zem_a = zem / (tti_raw ** 2 + eps)
+        zev_a = zev / (tti_raw + eps)
+        zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
+        zev_a = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
+        zema_mag = np.abs(zem_a); zema_u = zem_a / (zema_mag + eps)
+        zeva_mag = np.abs(zev_a); zeva_u = zev_a / (zeva_mag + eps)
+
+        # attitude / actuators
+        ang_vel   = state_matrix[:, 3, :].real
+        t1_ang    = state_matrix[:, 4, :].real
+        t2_ang    = state_matrix[:, 5, :].real
+        t1_thrust = action_matrix[:, 0, :]
+        t2_thrust = action_matrix[:, 1, :]
 
         obs = np.stack([
-            delta.real, delta.imag,
-            prev_delta.real, prev_delta.imag,
-            vel.real, vel.imag,
-            np.sin(angle), np.cos(angle),
-            ang_vel,
-            t1_ang, t2_ang,
+            dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
+            vel_mag / 10.0, vel_u.real, vel_u.imag,
+            relvel_mag / 10.0, relvel_u.real, relvel_u.imag,
+            acc_mag, acc_u.real, acc_u.imag,
+            zema_mag, zema_u.real, zema_u.imag,
+            zeva_mag, zeva_u.real, zeva_u.imag,
+            np.sin(angle), np.cos(angle), ang_vel,
+            t1_ang, t2_ang, t1_thrust, t2_thrust,
         ], axis=1)
-        prev_delta = delta.copy()
 
         action_matrix = Brain.forward(obs)
 

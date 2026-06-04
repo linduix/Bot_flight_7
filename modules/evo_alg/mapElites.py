@@ -55,8 +55,8 @@ class MAB():
 class Archive():
     def __init__(self, res) -> None:
         # descriptor minmax; x: mean gimble angle, y: activation variance
-        self.xrange: tuple = (0.20, .9)
-        self.yrange: tuple = (0.00, 0.25)
+        self.xrange: tuple = (0.20, .8)
+        self.yrange: tuple = (0.02, 0.25)
 
         # archive matrices
         self.res  = res

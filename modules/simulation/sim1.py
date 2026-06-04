@@ -231,6 +231,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     
     # prenitialize values
     prev_los   = None
+    prev_vel   = None
     time = 0
 
     # hoisted loop constants
@@ -248,72 +249,88 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         state_matrix[:, 3, :] += w_kick
 
         # MAKE OBSERVATION ARRAY -----------------------------------------------------------
-        # obs values (predictive GNC set, fully Markov):
-        #  1. zem x,        2. zem y
-        #  3. zev x,        4. zev y
-        #  5. los rate
-        #  6. sin(angle),   7. cos(angle)
-        #  8. ang velocity
-        #  9. t1 angle,    10. t2 angle
-
-        # deltas
-        # have to do this weird shit to properly reference tickpos per trial
-        # essentially ticks is a set of indexes referencing col num so we give it rows to align with its trial
-        # so a tick of [2, 3] at row n means tick 2 (col 2) in trial 0 (row 0), [0, 2]; and next would be coord [1, 3]
+        # obs values (27)  -- each vector as [magnitude, unit_x, unit_y]; frame in []
+        #   target geometry:
+        #     1. dist            2. los ux     3. los uy      [local]
+        #     4. los rate [world]  5. tti [scalar]
+        #   self velocity [local]:        6. |vel|     7. ux   8. uy
+        #   relative velocity [local]:    9. |relvel| 10. ux  11. uy
+        #   prev-tick net accel [local]: 12. |acc|    13. ux  14. uy
+        #   guidance accel cmds [local] (mag tanh-capped to max_a):
+        #    15. |zem_a| 16. ux 17. uy        18. |zev_a| 19. ux 20. uy
+        #   attitude [world]: 21. sin(angle) 22. cos(angle) 23. ang vel
+        #   actuators [local/cmd]: 24. t1 angle 25. t2 angle 26. t1 thrust 27. t2 thrust (last tick)
         angle        = state_matrix[:, 2, :].real # type:ignore
         target       = tick_pos[arangeS, ticks]
         delta_world  = target - state_matrix[:, 0, :]
         delta_local  = delta_world * np.exp(-1j * angle)
 
-        # obs foundational calc
-        # distance (magnitude) (N, S)
-        dist = np.abs(delta_world)
-        # los unit vector (direction) (N, S)
-        los_u  = delta_world / (dist + eps)
-
+        # --- target geometry ---
+        dist  = np.abs(delta_world)                # range (magnitude)
+        los_u = delta_world / (dist + eps)         # world unit dir (for rate)
+        los_local = delta_local / (dist + eps)     # local unit dir
         if prev_los is None:
             prev_los = los_u
-
-        # los rate rads/s (N, S)
-        los_rate = np.angle(los_u / prev_los) / dt
+        # los rate in LOCAL frame = inertial los rate - drone angular velocity
+        # (los_u stays world for the calc; only the obs value is converted to body)
+        los_rate = np.tanh((np.angle(los_u / prev_los) / dt - state_matrix[:, 3, :].real) / 3.0)
         prev_los = los_u
 
-        # velocity
+        # --- self velocity (local) ---
         vel = state_matrix[:, 1, :] * np.exp(-1j * angle)
+        vel_mag = np.abs(vel)
+        vel_u   = vel / (vel_mag + eps)
 
-        # target prev loc
+        # --- relative velocity (drone - target, local) ---
         prev_ticks  = np.maximum(ticks - 1, 0)
-        target_prev = tick_pos[arangeS, prev_ticks]
-        # target vel estimate
-        v_target = (target - target_prev) / dt
+        v_target    = (target - tick_pos[arangeS, prev_ticks]) / dt
         v_target_local = v_target * np.exp(-1j * angle)
         rel_vel = vel - v_target_local
+        relvel_mag = np.abs(rel_vel)
+        relvel_u   = rel_vel / (relvel_mag + eps)
 
-        # closest approach distance m (project target distance onto relative velocity)
+        # --- prev-tick net acceleration (world -> local) ---
+        vel_world = state_matrix[:, 1, :]
+        if prev_vel is None:
+            prev_vel = vel_world
+        net_acc = ((vel_world - prev_vel) / dt) * np.exp(-1j * angle)
+        prev_vel = vel_world
+        acc_mag = np.abs(net_acc)
+        acc_u   = net_acc / (acc_mag + eps)
+
+        # --- time to closest approach ---
         closest_approach = (delta_local * np.conjugate(rel_vel)).real / (np.abs(rel_vel) + eps)
-        # time to intercept
-        tti = np.clip(closest_approach / (np.abs(rel_vel) + eps), -1.0, 1.0)
+        tti_raw = closest_approach / (np.abs(rel_vel) + eps)
+        tti_obs = np.tanh(tti_raw / 10.0)
 
-        # zero effort miss (how far it will miss target if it just coasts to target)
-        # zem = target position - projected drone position - gravity correction
-        zem = delta_local - (rel_vel * tti) + (0.5 * -9.81j * np.exp(-1j * angle) * (tti ** 2))
+        # --- guidance accel commands (zem/zev projected 1s w/ gravity -> PN form, mag-capped) ---
+        horizon   = 1.0
+        grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)  # world gravity -> body frame
+        zem = delta_local - rel_vel * horizon + 0.5 * grav_body * horizon ** 2
+        zev = v_target_local - vel + grav_body * horizon
+        zem_a = zem / (tti_raw ** 2 + eps)
+        zev_a = zev / (tti_raw + eps)
+        zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
+        zev_a = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
+        zema_mag = np.abs(zem_a); zema_u = zem_a / (zema_mag + eps)
+        zeva_mag = np.abs(zev_a); zeva_u = zev_a / (zeva_mag + eps)
 
-        # zero effor velocity (velocity matching after coasting till tti)
-        # zev = v target - projected v drone - gravity correction
-        zev = v_target_local - vel + -9.81j * np.exp(-1j * angle) * tti
-
-        # angles
-        ang_vel = state_matrix[:, 3, :].real # type:ignore
-        t1_ang  = state_matrix[:, 4, :].real # type:ignore
-        t2_ang  = state_matrix[:, 5, :].real # type:ignore
+        # --- attitude / actuators ---
+        ang_vel   = state_matrix[:, 3, :].real # type:ignore
+        t1_ang    = state_matrix[:, 4, :].real # type:ignore
+        t2_ang    = state_matrix[:, 5, :].real # type:ignore
+        t1_thrust = action_matrix[:, 0, :]     # last tick's thrust commands
+        t2_thrust = action_matrix[:, 1, :]
 
         obs = np.stack([
-            zem.real, zem.imag,
-            zev.real, zev.imag,
-            los_rate,
-            np.sin(angle), np.cos(angle),
-            ang_vel,
-            t1_ang, t2_ang
+            dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
+            vel_mag / 10.0, vel_u.real, vel_u.imag,
+            relvel_mag / 10.0, relvel_u.real, relvel_u.imag,
+            acc_mag, acc_u.real, acc_u.imag,
+            zema_mag, zema_u.real, zema_u.imag,
+            zeva_mag, zeva_u.real, zeva_u.imag,
+            np.sin(angle), np.cos(angle), ang_vel,
+            t1_ang, t2_ang, t1_thrust, t2_thrust,
         ], axis=1) # have to have 3 dim for forward pass (N, inputs, S)
 
         # FORWARD PASS OBSERVATIONS --------------------------------------------------------
@@ -325,7 +342,6 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
         # FITNESS CALULATIONS --------------------------------------------------------------
         # vratio fitness component (error form, hover-safe):
-
         # target vel projected onto approach direction (N, S)
         v_tgt_par = (v_target * np.conj(los_u)).real
         # max safe approach velocity (N, S)
@@ -351,7 +367,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         ideal_par = v_tgt_par + safe_v_term
         scale = np.maximum(np.abs(ideal_par), floor)
         # inverted quadratic centered at err=0, mild negative for wrong-way ticks
-        score = np.clip(1.0 - (err / scale) ** 2, -0.5, 1.0)
+        score = np.clip(1.0 - (err / scale) ** 2, -0.1, 1.0)
         score = score / (1 + np.sqrt(dist))
 
         fitness_velo += dt * score # (N, S)
@@ -374,8 +390,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     var_acti = var_acti.mean(axis=(1, 2)) # (N, )
     mean_gimb = mean_gimb / total_ticks   # (N, )
 
-    # keep raw fitness (incl. negatives) so the archive has a gradient to climb;
-    # empty cells are -inf and contrib handles negative occupants.
+    # floor whole-episode fitness at 0, negatives within episode still shape gradient
+    # fitness = np.maximum(fitness_velo, 0.0)
     fitness = fitness_velo
 
     top_idx = fitness.mean(axis=1).argsort()[-5:]

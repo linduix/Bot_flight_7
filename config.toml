@@ -1,5 +1,5 @@
 [network]
-layers = [10, 24, 18, 12, 4]
+layers = [27, 48, 48, 4]
 hidden_activation = "leaky_relu"
 output_activation = "tanh"
 
