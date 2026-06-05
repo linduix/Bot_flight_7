@@ -14,7 +14,7 @@ SCREEN_H = 720
 
 # playback slowdown factor: 1 = normal speed, 2 = half speed, 4 = quarter speed, etc.
 # only affects how fast it plays on screen — physics still steps at the training dt.
-PLAYBACK_SLOWDOWN = 4.0
+PLAYBACK_SLOWDOWN = 1.0
 
 
 # world point the camera is centered on (complex, world meters). Updated each frame
@@ -234,8 +234,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
 
     # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
     impulse_prob    = 4 * dt / settings['limit']
-    impulse_v_sigma = 1.5
-    impulse_w_sigma = 1.5
+    impulse_v_sigma = 0.5
+    impulse_w_sigma = 0.5
 
     action_matrix = np.zeros((N, 4, S), dtype=float)
 
@@ -249,7 +249,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
 
     # fitness + descriptor accumulators
     # descriptors: mean gimbal angle, activation variance
-    fitness   = np.zeros((N, S))
+    fitness     = np.zeros((N, S))
+    track_velo  = np.zeros((N, S))   # alpha-scaled track sum (running)
+    effort_velo = np.zeros((N, S))   # (1-alpha)-scaled effort sum (running)
+    alpha = 0.7
     sum_acti  = np.zeros((N, 4, S))
     sum_acti2 = np.zeros((N, 4, S))
     mean_gimb = np.zeros(N)
@@ -356,36 +359,37 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         # FITNESS (tracking x effort, mirror sim1.py) -------------------------------------
         # SHARED ideal velocity (used by both components)
         v_tgt_par    = (v_target * np.conj(los_u)).real
-        safe_v       = np.sqrt(2 * max_a * (dist + eps_d))
+        safe_v       = 0.8 * np.sqrt(2 * max_a * (dist + eps_d))
         smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
         safe_v_term  = safe_v * smooth_scale
         ideal_vel    = v_target + safe_v_term * los_u
 
         # TRACKING component (vratio): achieved velocity vs ideal_vel
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
-        track_scale = np.maximum(np.abs(v_tgt_par + safe_v_term), floor)
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+        track_scale = np.maximum(np.abs(ideal_vel), floor)
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, -0.2, 1.0)
 
         # EFFORT component: best-effort reachable velocity v_be toward ideal_vel, dv-scaled
         v_free = prev_vel + -9.81j * dt
         dv = max_a * dt
-        ideal_u = ideal_vel / (np.abs(ideal_vel) + eps)
-        err_v  = ideal_vel - v_free
-        e_par  = (err_v * np.conjugate(ideal_u)).real
-        e_perp = err_v - e_par * ideal_u
-        e_perp_mag = np.abs(e_perp)
-        perp_use  = np.minimum(e_perp_mag, dv)
-        remaining = np.sqrt(dv * dv - perp_use * perp_use)
-        par_use   = np.clip(e_par, -remaining, remaining)
-        v_be = v_free + perp_use * (e_perp / (e_perp_mag + eps)) + par_use * ideal_u
+        err_v   = ideal_vel - v_free
+        err_mag = np.abs(err_v)
+        step    = np.minimum(err_mag, dv)
+        v_be    = v_free + step * (err_v / (err_mag + eps))
 
         prev_vel = vel_world
         effort_err = np.abs(state_matrix[:, 1, :] - v_be)
-        effort = np.clip(1.0 - (effort_err / dv) ** 2, 0.0, 1.0)
+        effort = np.clip(1.0 - (effort_err / dv) ** 2, -0.05, 1.0)
 
-        # FINAL = tracking x effort
-        score = track * effort
-        fitness += dt * score
+        # FINAL = alpha-weighted sum of track and effort (matches sim1.py)
+        prox = 1.0 / (1.0 + np.sqrt(dist))
+        pretouch_scale = np.where(toggle, 1.0, 0.1)
+        track_term  = alpha * track * prox * pretouch_scale
+        effort_term = (1.0 - alpha) * effort * prox * pretouch_scale
+        score = track_term + effort_term
+        fitness     += dt * score
+        track_velo  += dt * track_term
+        effort_velo += dt * effort_term
 
         # descriptors
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
@@ -478,16 +482,22 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
             F_body   = (max(0.0, float(act[0])) * drone_conf['th_force']) * (1j * np.exp(1j * ht1)) \
                      + (max(0.0, float(act[1])) * drone_conf['th_force']) * (1j * np.exp(1j * ht2))
             a_thrust = (F_body * np.exp(1j * hang)) / drone_conf['M']     # world-frame thrust accel
-            doing = (a_thrust * dt) * AMP                                 # actual thrust impulse
+            a_net    = a_thrust - 1j * drone_conf['G']                    # net accel = thrust + gravity
+            doing = (a_net * dt) * AMP                                    # actual net dv this tick
             draw_vector(screen, root, doing, (255, 80, 80), scale=VS)
 
             screen.blit(font.render("current v", True, (80, 200, 255)), (10, 40))
             screen.blit(font.render("should thrust (v_be - v_free)", True, (255, 170, 40)), (10, 64))
-            screen.blit(font.render("actual thrust this tick", True, (255, 80, 80)), (10, 88))
+            screen.blit(font.render("actual net accel this tick", True, (255, 80, 80)), (10, 88))
             screen.blit(font.render("ideal v (pre-cap)", True, (230, 90, 220)), (10, 112))
 
         fps = clock.get_fps()
         screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
+        # highlighted drone's running fitness components (mean over seeds, alpha-scaled)
+        hi_track  = float(track_velo [highlight].mean())
+        hi_effort = float(effort_velo[highlight].mean())
+        hi_total  = hi_track + hi_effort
+        screen.blit(font.render(f"track: {hi_track:.2f}  effort: {hi_effort:.2f}  total: {hi_total:.2f}", True, (180, 180, 180)), (10, 136))
 
         pg.display.flip()
         clock.tick(max(1, int(60 / PLAYBACK_SLOWDOWN)))

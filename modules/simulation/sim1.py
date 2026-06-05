@@ -206,8 +206,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
     # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
     impulse_prob    = 4 * dt / settings['limit']
-    impulse_v_sigma = 1.5
-    impulse_w_sigma = 1.5
+    impulse_v_sigma = 0.5
+    impulse_w_sigma = 0.5
 
     # initial action matrix
     action_matrix = np.zeros((N, 4, S), dtype=np.float32)
@@ -218,7 +218,9 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
 
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
-    fitness_velo = np.zeros((N, S),    dtype=np.float32)
+    fitness_velo  = np.zeros((N, S), dtype=np.float32)
+    track_velo    = np.zeros((N, S), dtype=np.float32)  # diagnostic: alpha-scaled track sum
+    effort_velo   = np.zeros((N, S), dtype=np.float32)  # diagnostic: (1-alpha)-scaled effort sum
     sum_acti2    = np.zeros((N, 4, S), dtype=np.float32)
     sum_acti     = np.zeros((N, 4, S), dtype=np.float32)
     mean_gimb    = np.zeros(N,         dtype=np.float32)
@@ -344,7 +346,7 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # the target's lateral drift, so the vector form scores it for free. used by both
         # the tracking and effort components below.
         v_tgt_par    = (v_target * np.conj(los_u)).real      # target vel along approach dir (N, S)
-        safe_v       = np.sqrt(2 * max_a * (dist + eps_d))   # max safe approach velocity (N, S)
+        safe_v       = 0.8 * np.sqrt(2 * max_a * (dist + eps_d))   # max safe approach velocity (N, S)
         # smoothly taper the approach budget to 0 inside the touch radius. linear scale turns
         # the sqrt profile into dist^1.5 near the target (zero slope at origin) -> no velocity-
         # command cliff at 0.5 and no overshoot-inducing steep sqrt tangent. collapses to hover.
@@ -356,37 +358,44 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # how close the achieved velocity actually is to ideal_vel. anchors the reward to the
         # high-level goal so the drone cant farm effort points from a self-made bad state.
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
-        track_scale = np.maximum(np.abs(v_tgt_par + safe_v_term), floor)  # floored for hover
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+        track_scale = np.maximum(np.abs(ideal_vel), floor)  # floored for hover
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, -0.2, 1.0)
 
-        # EFFORT component (best-effort velocity, dv-scaled) -------------------------------
-        # v_be = the velocity the drone SHOULD have reached this tick: start from v_free
-        # (start-of-tick vel + gravity drift) and move toward ideal_vel by at most the dv
-        # budget. perp-first: kill lateral (off-ideal) error before closing speed, and clamp
-        # the parallel move to the real error so we never overshoot ideal_vel.
+        # EFFORT component (directional thrust efficiency) ----------------------------------
+        # best-effort direction = unit vector from v_free toward ideal_vel. actual_dv is the
+        # velocity change from thrust alone this tick (gravity already baked into v_free).
+        # score = projection of actual_dv onto best-effort direction, normalized to dv.
+        # rewards using the dv budget in the right direction; small negative penalty for
+        # thrust pointed against the best-effort direction.
         v_free = prev_vel + -9.81j * dt
         dv = max_a * dt # the delta v budget for this tick
-        ideal_u = ideal_vel / (np.abs(ideal_vel) + eps)
 
-        err_v  = ideal_vel - v_free                       # what we'd need to add to reach ideal
-        e_par  = (err_v * np.conjugate(ideal_u)).real     # signed closing error along ideal
-        e_perp = err_v - e_par * ideal_u                  # lateral error (off ideal direction)
-        e_perp_mag = np.abs(e_perp)
-        perp_use  = np.minimum(e_perp_mag, dv)                      # cancel lateral within budget
-        remaining = np.sqrt(dv * dv - perp_use * perp_use)         # budget left for closing
-        par_use   = np.clip(e_par, -remaining, remaining)          # close/decelerate, no overshoot
-        v_be = v_free + perp_use * (e_perp / (e_perp_mag + eps)) + par_use * ideal_u
+        err_v    = ideal_vel - v_free
+        err_mag  = np.abs(err_v)
+        err_unit = err_v / (err_mag + eps)
 
-        # how well this tick's actual thrust matched that best-effort correction (dv-scaled)
+        actual_dv  = state_matrix[:, 1, :] - v_free
+        projection = (actual_dv * np.conjugate(err_unit)).real
+
         prev_vel = vel_world
-        effort_err = np.abs(state_matrix[:, 1, :] - v_be)
-        effort = np.clip(1.0 - (effort_err / dv) ** 2, 0.0, 1.0)
+        effort = np.clip(projection / dv, -0.1, 1.0)
 
-        # FINAL velocity score = tracking x effort ----------------------------------------
-        # needs BOTH: tracking the target AND spending the budget well. both clipped to [0,1]
-        # so the product stays meaningful (no neg x neg = pos).
-        score = track * effort
-        fitness_velo += dt * score # (N, S)
+        # FINAL velocity score = alpha-weighted sum of tracking and effort ----------------
+        # sum (not product) avoids double-jeopardy: a bad tick gets penalized once, not squared.
+        # track is the goal-aligned anchor; effort is the shaper biasing search inside the basin.
+        alpha = .5
+        # proximity weight: 1 / (1 + sqrt(dist)). pulls more reward when close to target,
+        # so hovering tight beats coasting far. applied uniformly to both components.
+        prox = 1.0 / (1.0 + dist)
+        # pre-touch scaledown: reward the approach phase at 0.1x so the drone has incentive
+        # to find the target but post-touch chain-following dominates fitness.
+        pretouch_scale = np.where(toggle, 1.0, 0.05)
+        track_term  = alpha * track * prox * pretouch_scale
+        effort_term = (1.0 - alpha) * effort * prox * pretouch_scale
+        score = track_term + effort_term
+        fitness_velo += dt * score        # (N, S)
+        track_velo   += dt * track_term   # diagnostic: alpha-scaled track contribution
+        effort_velo  += dt * effort_term  # diagnostic: (1-alpha)-scaled effort contribution
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
@@ -420,7 +429,11 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
     return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max(),
-                         'fit_velo': fitness_velo.mean()}
+                         'fit_velo': fitness_velo.mean(),
+                         # per-drone arrays (mean over seeds) so parallel_sim can pick a global top-K
+                         'per_fit'   : fitness.mean(axis=1),
+                         'per_track' : track_velo.mean(axis=1),
+                         'per_effort': effort_velo.mean(axis=1)}
 
 def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> tuple[list[Individual], dict]:
     # get ocpu count
@@ -445,17 +458,31 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     chunk_results = Mpool.starmap(sim, args)
 
     scored = []
-    stats  = {'fit_max': -np.inf, 'fit_mean': 0.0, 'fit_velo': 0.0}
+    stats  = {'fit_max': -np.inf, 'fit_mean': 0.0, 'fit_velo': 0.0,
+              'fit_track': 0.0, 'fit_effort': 0.0}
+    per_fit_all, per_track_all, per_effort_all = [], [], []
     for indvs, stat in chunk_results:
         scored.extend(indvs)
-        stats['fit_mean'] += stat['fit_mean']
-        stats['fit_velo'] += stat['fit_velo']
+        stats['fit_mean']   += stat['fit_mean']
+        stats['fit_velo']   += stat['fit_velo']
         stats['fit_max' ] =  max(stats['fit_max' ], stat['fit_max' ])
+        per_fit_all   .append(stat['per_fit'])
+        per_track_all .append(stat['per_track'])
+        per_effort_all.append(stat['per_effort'])
 
-    stats['fit_mean'] /= cpus
-    stats['fit_velo'] /= cpus
+    stats['fit_mean']   /= cpus
+    stats['fit_velo']   /= cpus
 
-    print(f"fitness, {stats['fit_velo']:.2f}, {stats['fit_mean']:.2f}")
+    # global top 10 by per-drone fitness; report their track/effort means
+    per_fit    = np.concatenate(per_fit_all)
+    per_track  = np.concatenate(per_track_all)
+    per_effort = np.concatenate(per_effort_all)
+    k = min(10, per_fit.size)
+    top10 = np.argpartition(per_fit, -k)[-k:]
+    stats['fit_track']  = float(per_track [top10].mean())
+    stats['fit_effort'] = float(per_effort[top10].mean())
+
+    print(f"track, {stats['fit_track']:.2f}, effort, {stats['fit_effort']:.2f}")
 
     return scored, stats
 
