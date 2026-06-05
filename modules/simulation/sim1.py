@@ -204,8 +204,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     state_matrix[:, 3, :] = ang_vel0
     # columns 4, 5 (thruster angles) stay 0
 
-    # impulse (wind gust) params
-    impulse_prob    = 0.01
+    # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
+    impulse_prob    = 4 * dt / settings['limit']
     impulse_v_sigma = 1.5
     impulse_w_sigma = 1.5
 
@@ -227,8 +227,8 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']
     eps   = 1e-8
     eps_d = 0.05
-    floor = 0.5   # hover tolerance, m/s
-    
+    floor = 0.5   # hover tolerance for the tracking scale, m/s
+
     # prenitialize values
     prev_los   = None
     prev_vel   = None
@@ -294,7 +294,6 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         if prev_vel is None:
             prev_vel = vel_world
         net_acc = ((vel_world - prev_vel) / dt) * np.exp(-1j * angle)
-        prev_vel = vel_world
         acc_mag = np.abs(net_acc)
         acc_u   = net_acc / (acc_mag + eps)
 
@@ -340,35 +339,53 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         toggle |= dist < 0.5
 
         # FITNESS CALULATIONS --------------------------------------------------------------
-        # vratio fitness component (error form, hover-safe):
-        # target vel projected onto approach direction (N, S)
-        v_tgt_par = (v_target * np.conj(los_u)).real
-        # max safe approach velocity (N, S)
-        safe_v    = np.sqrt(2 * max_a * (dist + eps_d))
-        # smoothly taper the approach budget to 0 inside the touch radius. linear
-        # scale turns the sqrt profile into dist^1.5 near the target (zero slope at
-        # origin) -> no velocity-command cliff at 0.5 and no overshoot-inducing
-        # steep sqrt tangent right at the target. collapses to pure hover-match.
+        # SHARED: ideal drone vel VECTOR = match target motion + approach budget along los_u.
+        # approach budget is purely along los_u (toward target); perpendicular ideal is just
+        # the target's lateral drift, so the vector form scores it for free. used by both
+        # the tracking and effort components below.
+        v_tgt_par    = (v_target * np.conj(los_u)).real      # target vel along approach dir (N, S)
+        safe_v       = np.sqrt(2 * max_a * (dist + eps_d))   # max safe approach velocity (N, S)
+        # smoothly taper the approach budget to 0 inside the touch radius. linear scale turns
+        # the sqrt profile into dist^1.5 near the target (zero slope at origin) -> no velocity-
+        # command cliff at 0.5 and no overshoot-inducing steep sqrt tangent. collapses to hover.
         smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
         safe_v_term  = safe_v * smooth_scale
-        # ideal drone vel VECTOR = match target motion + approach budget along los_u.
-        # approach budget is purely along los_u (toward target); perpendicular ideal is
-        # just the target's lateral drift, so the vector form scores it for free.
-        ideal_vel = v_target + safe_v_term * los_u
+        ideal_vel    = v_target + safe_v_term * los_u
 
-        # full 2D velocity error magnitude (N, S). expands to sqrt(par_err^2 +
-        # perp_err^2): the parallel piece is identical to the old projection form,
-        # the perpendicular piece penalizes orbiting / lateral drift beyond target.
-        err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
-        # tolerance from the parallel ideal magnitude, floored so hover (ideal=0)
-        # doesnt explode (N, S). large during fast approach -> lenient on lateral
-        # velocity; floors at hover -> tight, so orbiting is punished where it hurts.
-        ideal_par = v_tgt_par + safe_v_term
-        scale = np.maximum(np.abs(ideal_par), floor)
-        # inverted quadratic centered at err=0, mild negative for wrong-way ticks
-        score = np.clip(1.0 - (err / scale) ** 2, -0.1, 1.0)
-        score = score / (1 + np.sqrt(dist))
+        # TRACKING component (vratio, error form, hover-safe) ------------------------------
+        # how close the achieved velocity actually is to ideal_vel. anchors the reward to the
+        # high-level goal so the drone cant farm effort points from a self-made bad state.
+        track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
+        track_scale = np.maximum(np.abs(v_tgt_par + safe_v_term), floor)  # floored for hover
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
 
+        # EFFORT component (best-effort velocity, dv-scaled) -------------------------------
+        # v_be = the velocity the drone SHOULD have reached this tick: start from v_free
+        # (start-of-tick vel + gravity drift) and move toward ideal_vel by at most the dv
+        # budget. perp-first: kill lateral (off-ideal) error before closing speed, and clamp
+        # the parallel move to the real error so we never overshoot ideal_vel.
+        v_free = prev_vel + -9.81j * dt
+        dv = max_a * dt # the delta v budget for this tick
+        ideal_u = ideal_vel / (np.abs(ideal_vel) + eps)
+
+        err_v  = ideal_vel - v_free                       # what we'd need to add to reach ideal
+        e_par  = (err_v * np.conjugate(ideal_u)).real     # signed closing error along ideal
+        e_perp = err_v - e_par * ideal_u                  # lateral error (off ideal direction)
+        e_perp_mag = np.abs(e_perp)
+        perp_use  = np.minimum(e_perp_mag, dv)                      # cancel lateral within budget
+        remaining = np.sqrt(dv * dv - perp_use * perp_use)         # budget left for closing
+        par_use   = np.clip(e_par, -remaining, remaining)          # close/decelerate, no overshoot
+        v_be = v_free + perp_use * (e_perp / (e_perp_mag + eps)) + par_use * ideal_u
+
+        # how well this tick's actual thrust matched that best-effort correction (dv-scaled)
+        prev_vel = vel_world
+        effort_err = np.abs(state_matrix[:, 1, :] - v_be)
+        effort = np.clip(1.0 - (effort_err / dv) ** 2, 0.0, 1.0)
+
+        # FINAL velocity score = tracking x effort ----------------------------------------
+        # needs BOTH: tracking the target AND spending the budget well. both clipped to [0,1]
+        # so the product stays meaningful (no neg x neg = pos).
+        score = track * effort
         fitness_velo += dt * score # (N, S)
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------

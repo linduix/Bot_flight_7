@@ -8,15 +8,40 @@ import numpy as np
 import pygame as pg
 
 
-METERS_TO_PIXELS = 20
+METERS_TO_PIXELS = 30
 SCREEN_W = 1280
 SCREEN_H = 720
 
+# playback slowdown factor: 1 = normal speed, 2 = half speed, 4 = quarter speed, etc.
+# only affects how fast it plays on screen — physics still steps at the training dt.
+PLAYBACK_SLOWDOWN = 4.0
+
+
+# world point the camera is centered on (complex, world meters). Updated each frame
+# to follow the highlighted drone so it stays in the middle of the screen.
+CAMERA = 0j
+
 
 def world_to_screen(pos_complex: complex) -> tuple[int, int]:
-    x = pos_complex.real * METERS_TO_PIXELS + SCREEN_W / 2
-    y = SCREEN_H / 2 - pos_complex.imag * METERS_TO_PIXELS
+    rel = pos_complex - CAMERA
+    x = rel.real * METERS_TO_PIXELS + SCREEN_W / 2
+    y = SCREEN_H / 2 - rel.imag * METERS_TO_PIXELS
     return int(x), int(y)
+
+
+def draw_vector(screen, base: complex, vec: complex, color, scale=0.4, width=2, head=0.35):
+    # draw `vec` (a velocity in m/s, complex) as an arrow rooted at world point `base`.
+    # `scale` is a seconds-like factor so the arrow length = |vec| * scale meters.
+    if abs(vec) < 1e-6:
+        return
+    tip = base + vec * scale
+    bx, by = world_to_screen(base)
+    tx, ty = world_to_screen(tip)
+    pg.draw.line(screen, color, (bx, by), (tx, ty), width)
+    back = -vec / abs(vec)                     # unit dir from tip back toward base
+    for a in (0.5, -0.5):                       # barbs splayed +/-0.5rad off the backward dir
+        barb = tip + head * back * np.exp(1j * a)
+        pg.draw.line(screen, color, (tx, ty), world_to_screen(barb), width)
 
 
 def build_drone_surf(width_m, height_m, mtp):
@@ -175,12 +200,19 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     N = len(individuals)
     S = 4  # trials per drone — only trial 0 is rendered; rest run "headlessly" so chains can be shown faintly
 
+    # fitness constants (mirror sim1.py)
+    max_a = 2 * drone_conf['th_force'] / drone_conf['M']
+    eps   = 1e-8
+    eps_d = 0.05
+    floor = 0.5
+
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
 
-    speed_factor = 1
-    frame_dt = 1 / 60
-    dt = frame_dt / speed_factor
+    # physics MUST step at the same dt the controller was trained on (sim1.py dt=.016),
+    # otherwise the high-gain policy mistimes and flies wonky. render still caps at 60fps;
+    # playback ends up ~0.96x real-time, which is fine.
+    dt = 0.016
 
     # generated target chains (one per trial, same logic as headless sim)
     rng = np.random.default_rng(seed)
@@ -200,8 +232,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     state_matrix[:, 2, :] = angle0
     state_matrix[:, 3, :] = ang_vel0
 
-    # impulse (wind gust) params
-    impulse_prob    = 0.01
+    # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
+    impulse_prob    = 4 * dt / settings['limit']
     impulse_v_sigma = 1.5
     impulse_w_sigma = 1.5
 
@@ -211,7 +243,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     toggle = np.zeros((N, S), dtype=bool)
     ticks  = np.zeros((N, S), dtype=int)
     particles = ParticlePool(max_particles=4000)
-    prev_delta = None
+    arangeS  = np.arange(S)
+    prev_los = None
+    prev_vel = None
 
     # fitness + descriptor accumulators
     # descriptors: mean gimbal angle, activation variance
@@ -243,39 +277,115 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
 
         # per-(drone, trial) target — clamp ticks to last chain entry per trial
         idx = np.minimum(ticks, tick_pos.shape[1] - 1)           # (N, S)
-        target = tick_pos[np.arange(S), idx]                    # (N, S)
+        target = tick_pos[arangeS, idx]                          # (N, S)
 
-        # MAKE OBSERVATION ARRAY
-        delta_world = target - state_matrix[:, 0, :]
-        delta = delta_world * np.exp(-1j * state_matrix[:, 2, :].real)
-        if prev_delta is None:
-            prev_delta = delta.copy()
-        vel     = state_matrix[:, 1, :] * np.exp(-1j * state_matrix[:, 2, :].real)
-        angle   = state_matrix[:, 2, :].real # type:ignore
-        ang_vel = state_matrix[:, 3, :].real # type:ignore
-        t1_ang  = state_matrix[:, 4, :].real # type:ignore
-        t2_ang  = state_matrix[:, 5, :].real # type:ignore
+        # MAKE OBSERVATION ARRAY (27 inputs, mirror sim1.py) -------------------------------
+        angle        = state_matrix[:, 2, :].real
+        delta_world  = target - state_matrix[:, 0, :]
+        delta_local  = delta_world * np.exp(-1j * angle)
+
+        # --- target geometry ---
+        dist  = np.abs(delta_world)
+        los_u = delta_world / (dist + eps)
+        los_local = delta_local / (dist + eps)
+        if prev_los is None:
+            prev_los = los_u
+        los_rate = np.tanh((np.angle(los_u / prev_los) / dt - state_matrix[:, 3, :].real) / 3.0)
+        prev_los = los_u
+
+        # --- self velocity (local) ---
+        vel = state_matrix[:, 1, :] * np.exp(-1j * angle)
+        vel_mag = np.abs(vel)
+        vel_u   = vel / (vel_mag + eps)
+
+        # --- relative velocity (drone - target, local) ---
+        prev_idx       = np.maximum(idx - 1, 0)
+        v_target       = (target - tick_pos[arangeS, prev_idx]) / dt
+        v_target_local = v_target * np.exp(-1j * angle)
+        rel_vel = vel - v_target_local
+        relvel_mag = np.abs(rel_vel)
+        relvel_u   = rel_vel / (relvel_mag + eps)
+
+        # --- prev-tick net acceleration (world -> local) ---
+        vel_world = state_matrix[:, 1, :].copy()
+        if prev_vel is None:
+            prev_vel = vel_world
+        net_acc = ((vel_world - prev_vel) / dt) * np.exp(-1j * angle)
+        acc_mag = np.abs(net_acc)
+        acc_u   = net_acc / (acc_mag + eps)
+
+        # --- time to closest approach ---
+        closest_approach = (delta_local * np.conjugate(rel_vel)).real / (np.abs(rel_vel) + eps)
+        tti_raw = closest_approach / (np.abs(rel_vel) + eps)
+        tti_obs = np.tanh(tti_raw / 10.0)
+
+        # --- guidance accel commands: ZEM/ZEV at t_go = tti_raw w/ gravity -> PN form, mag-capped ---
+        grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)
+        zem = delta_local - rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2
+        zev = v_target_local - vel + grav_body * tti_raw
+        zem_a = zem / (tti_raw ** 2 + eps)
+        zev_a = zev / (tti_raw + eps)
+        zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
+        zev_a = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
+        zema_mag = np.abs(zem_a); zema_u = zem_a / (zema_mag + eps)
+        zeva_mag = np.abs(zev_a); zeva_u = zev_a / (zeva_mag + eps)
+
+        # --- attitude / actuators ---
+        ang_vel   = state_matrix[:, 3, :].real
+        t1_ang    = state_matrix[:, 4, :].real
+        t2_ang    = state_matrix[:, 5, :].real
+        t1_thrust = action_matrix[:, 0, :]
+        t2_thrust = action_matrix[:, 1, :]
 
         obs = np.stack([
-            delta.real, delta.imag,
-            prev_delta.real, prev_delta.imag,
-            vel.real, vel.imag,
-            np.sin(angle), np.cos(angle),
-            ang_vel,
-            t1_ang, t2_ang
-        ], axis=1)  # (N, 11, S)
-
-        prev_delta = delta.copy()
+            dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
+            vel_mag / 10.0, vel_u.real, vel_u.imag,
+            relvel_mag / 10.0, relvel_u.real, relvel_u.imag,
+            acc_mag, acc_u.real, acc_u.imag,
+            zema_mag, zema_u.real, zema_u.imag,
+            zeva_mag, zeva_u.real, zeva_u.imag,
+            np.sin(angle), np.cos(angle), ang_vel,
+            t1_ang, t2_ang, t1_thrust, t2_thrust,
+        ], axis=1)  # (N, 27, S)
 
         action_matrix = Brain.forward(obs)  # (N, 4, S)
 
         # PROGRESS SIMULATION
-        dist = np.abs(delta_world)
         toggle |= dist < 0.5
 
-        # fitness: 0.01x pre-touch, 1x post-touch
-        scale = np.where(toggle, 1.0, 0.01)
-        fitness += scale * dt / (1 + dist)
+        # FITNESS (tracking x effort, mirror sim1.py) -------------------------------------
+        # SHARED ideal velocity (used by both components)
+        v_tgt_par    = (v_target * np.conj(los_u)).real
+        safe_v       = np.sqrt(2 * max_a * (dist + eps_d))
+        smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
+        safe_v_term  = safe_v * smooth_scale
+        ideal_vel    = v_target + safe_v_term * los_u
+
+        # TRACKING component (vratio): achieved velocity vs ideal_vel
+        track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
+        track_scale = np.maximum(np.abs(v_tgt_par + safe_v_term), floor)
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+
+        # EFFORT component: best-effort reachable velocity v_be toward ideal_vel, dv-scaled
+        v_free = prev_vel + -9.81j * dt
+        dv = max_a * dt
+        ideal_u = ideal_vel / (np.abs(ideal_vel) + eps)
+        err_v  = ideal_vel - v_free
+        e_par  = (err_v * np.conjugate(ideal_u)).real
+        e_perp = err_v - e_par * ideal_u
+        e_perp_mag = np.abs(e_perp)
+        perp_use  = np.minimum(e_perp_mag, dv)
+        remaining = np.sqrt(dv * dv - perp_use * perp_use)
+        par_use   = np.clip(e_par, -remaining, remaining)
+        v_be = v_free + perp_use * (e_perp / (e_perp_mag + eps)) + par_use * ideal_u
+
+        prev_vel = vel_world
+        effort_err = np.abs(state_matrix[:, 1, :] - v_be)
+        effort = np.clip(1.0 - (effort_err / dv) ** 2, 0.0, 1.0)
+
+        # FINAL = tracking x effort
+        score = track * effort
+        fitness += dt * score
 
         # descriptors
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
@@ -292,6 +402,11 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         state_t0  = state_matrix[:, :, 0]
         action_t0 = action_matrix[:, :, 0]
         target_t0 = target[:, 0]
+
+        # camera follows the highlighted (main) drone — recenter on its trial-0 position
+        global CAMERA
+        if highlight is not None:
+            CAMERA = complex(state_t0[highlight, 0])
 
         # particles + draw
         spawn_thruster_particles(particles, state_t0, action_t0, drone_conf, [highlight])
@@ -340,11 +455,42 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
             tx, ty = world_to_screen(target_t0[highlight])
             pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
+            # scoring vectors for the highlighted drone (trial 0):
+            base_pos = state_t0[highlight, 0]
+            cur_v = state_matrix[highlight, 1, 0]
+            VS  = 0.4   # shared velocity scale
+            AMP = 5.0   # amplify the tiny per-tick thrust impulses so they're visible
+            draw_vector(screen, base_pos, ideal_vel[highlight, 0], (230, 90, 220), scale=VS)  # ideal (pre-cap)
+            draw_vector(screen, base_pos, cur_v,                   (80, 200, 255), scale=VS)  # current v
+
+            # both impulse arrows are measured from v_free (the do-nothing velocity) so they are
+            # directly comparable thrust impulses: SHOULD = v_be - v_free, DOING = actual thrust.
+            # rooted at the v_free tip; if red overlaps orange the drone thrust optimally.
+            vf   = v_free[highlight, 0]
+            root = base_pos + vf * VS
+            should = (v_be[highlight, 0] - vf) * AMP                      # ideal thrust impulse
+            draw_vector(screen, root, should, (255, 170, 40), scale=VS)
+
+            act  = action_t0[highlight]
+            ht1  = state_t0[highlight, 4].real
+            ht2  = state_t0[highlight, 5].real
+            hang = state_t0[highlight, 2].real
+            F_body   = (max(0.0, float(act[0])) * drone_conf['th_force']) * (1j * np.exp(1j * ht1)) \
+                     + (max(0.0, float(act[1])) * drone_conf['th_force']) * (1j * np.exp(1j * ht2))
+            a_thrust = (F_body * np.exp(1j * hang)) / drone_conf['M']     # world-frame thrust accel
+            doing = (a_thrust * dt) * AMP                                 # actual thrust impulse
+            draw_vector(screen, root, doing, (255, 80, 80), scale=VS)
+
+            screen.blit(font.render("current v", True, (80, 200, 255)), (10, 40))
+            screen.blit(font.render("should thrust (v_be - v_free)", True, (255, 170, 40)), (10, 64))
+            screen.blit(font.render("actual thrust this tick", True, (255, 80, 80)), (10, 88))
+            screen.blit(font.render("ideal v (pre-cap)", True, (230, 90, 220)), (10, 112))
+
         fps = clock.get_fps()
         screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
 
         pg.display.flip()
-        clock.tick(60)
+        clock.tick(max(1, int(60 / PLAYBACK_SLOWDOWN)))
 
     pg.quit()
 
