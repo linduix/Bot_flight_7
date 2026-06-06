@@ -56,8 +56,12 @@ if __name__=='__main__':
 
     else:
         alg = algorithm(resolution=RESOLUTION)
-        settings  = {'limit': 10.0, 'length': 10.0}
+        settings  = {'limit': 10.0, 'length': 10.0, 'perturbations': False, 'curriculum_progress': 0}
         seed = np.random.randint(0, 100)
+
+    # backfill keys for older checkpoints
+    settings.setdefault('perturbations', False)
+    settings.setdefault('curriculum_progress', 0)
 
     simulator = parallel_sim
     # simulator = sim
@@ -129,7 +133,7 @@ if __name__=='__main__':
                 top10 = np.sort(finite)[-10:].mean() if finite.size >= 10 else (finite.mean() if finite.size else 0.0)
                 if top10_old is None:
                     top10_old = top10
-                print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | top10 {top10:.2f}", flush=True)
+                print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | progress {settings['curriculum_progress']} | perturbations {settings['perturbations']} | top10 {top10:.2f}", flush=True)
 
                 # pool transition branch:
                 if alg.gen % 50 == 0:
@@ -137,6 +141,10 @@ if __name__=='__main__':
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05
+                        # count progression; enable perturbations after the 2nd advance
+                        settings['curriculum_progress'] += 1
+                        if settings['curriculum_progress'] >= 2:
+                            settings['perturbations'] = True
                         # regenerate seed pool
                         seed = np.random.randint(0, 100)
                         # revalidate existing best drones at pool end
@@ -147,7 +155,7 @@ if __name__=='__main__':
                         finite = alg.archive.fit[np.isfinite(alg.archive.fit)]
                         top10 = np.sort(finite)[-10:].mean() if finite.size >= 10 else (finite.mean() if finite.size else 0.0)
 
-                        print(f"  -> curriculum transition: length={settings['length']:.2f}  elites={len(elites)}", flush=True)
+                        print(f"  -> curriculum transition: length={settings['length']:.2f}  progress={settings['curriculum_progress']}  perturbations={settings['perturbations']}  elites={len(elites)}", flush=True)
                     top10_old = top10
 
                 # save checkpoint at generation threshold/new best

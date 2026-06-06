@@ -21,6 +21,18 @@ PLAYBACK_SLOWDOWN = 1.0
 # to follow the highlighted drone so it stays in the middle of the screen.
 CAMERA = 0j
 
+# seed mode: False = replay the checkpoint seed every loop, True = fresh random seed every loop.
+# toggled at runtime by pressing T inside the visual. takes effect on the NEXT playback.
+RANDOM_SEED_MODE = False
+
+# camera follow mode: True = camera tracks the highlighted drone, False = camera tracks
+# its current target. toggled with F inside the visual. takes effect on the SAME tick.
+FOLLOW_DRONE = True
+
+# scoring arrow overlay: True = draw the per-tick scoring vectors (ideal_vel, current vel,
+# ideal_dv, actual_dv) + their text labels. toggled with A inside the visual.
+SHOW_ARROWS = True
+
 
 def world_to_screen(pos_complex: complex) -> tuple[int, int]:
     rel = pos_complex - CAMERA
@@ -139,8 +151,9 @@ class ParticlePool:
 
 def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, drone_conf, indices):
     for i in indices:
-        t1_thrust = action_matrix[i, 0]
-        t2_thrust = action_matrix[i, 1]
+        # actual integrated throttle level (slot 6), not the rate command
+        t1_thrust = state_matrix[i, 6].real
+        t2_thrust = state_matrix[i, 6].imag
         pos   = state_matrix[i, 0]
         angle = state_matrix[i, 2].real
         t1ang = state_matrix[i, 4].real
@@ -175,7 +188,7 @@ def spawn_thruster_particles(pool: ParticlePool, state_matrix, action_matrix, dr
                 pool.spawn(t2pos, vel, start_alpha=100 * t2_thrust)
 
 
-def sim(individuals: list[Individual], settings, seed=None, featured=None) -> dict:
+def sim(individuals: list[Individual], settings, seed=None, featured=None, update_fitness=True) -> dict:
     # `featured` = indices drawn as full sprites; the rest render as ghost lines.
     # `highlight` (single) = max-fitness among featured; gets ring + thruster particles.
     fits = [ind.fitness for ind in individuals]
@@ -204,7 +217,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']
     eps   = 1e-8
     eps_d = 0.05
-    floor = 0.5
+    floor = 0.5    # hover tolerance for the tracking scale, m/s
+    effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
+    prox_k = 3.0 * np.log(2.0) / settings['length']  # exp decay constant: half-credit at dist = L/3
 
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
@@ -218,19 +233,27 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     rng = np.random.default_rng(seed)
     tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S)  # (S, n_ticks)
 
-    # randomized init, identical across drones AND trials here (visual only — only trial 0 displays)
-    angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
-    ang_vel0 = rng.uniform(-2.0, 2.0)
-    v_init_max = 3
-    v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
-    v_dir    = rng.uniform(-np.pi, np.pi)
-    vel0     = v_mag * np.exp(1j * v_dir)
+    # perturbations flag (settings) gates init randomization + wind gusts. when False,
+    # drones spawn at origin with zero velocity/angle/spin and no gusts.
+    perturbations = settings.get('perturbations', False)
 
-    state_matrix = np.zeros((N, 6, S), dtype=complex)
+    state_matrix = np.zeros((N, 7, S), dtype=complex)
     state_matrix[:, 0, :] = 0j
-    state_matrix[:, 1, :] = vel0
-    state_matrix[:, 2, :] = angle0
-    state_matrix[:, 3, :] = ang_vel0
+    # pre-spool throttles to hover (mirror sim1.py) so rate-command policies start viable
+    hover = drone_conf['M'] * abs(drone_conf['G']) / (2 * drone_conf['th_force'])
+    state_matrix[:, 6, :] = hover + 1j * hover
+
+    if perturbations:
+        # randomized init, identical across drones AND trials here (visual only — only trial 0 displays)
+        angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
+        ang_vel0 = rng.uniform(-2.0, 2.0)
+        v_init_max = 3
+        v_mag    = np.sqrt(rng.uniform(0, 1)) * v_init_max
+        v_dir    = rng.uniform(-np.pi, np.pi)
+        vel0     = v_mag * np.exp(1j * v_dir)
+        state_matrix[:, 1, :] = vel0
+        state_matrix[:, 2, :] = angle0
+        state_matrix[:, 3, :] = ang_vel0
 
     # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
     impulse_prob    = 4 * dt / settings['limit']
@@ -242,6 +265,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     # simulation state arrays
     toggle = np.zeros((N, S), dtype=bool)
     ticks  = np.zeros((N, S), dtype=int)
+    crashed = np.zeros((N, S), dtype=bool) # latched flag: drone has flown out of bounds
+    crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
     particles = ParticlePool(max_particles=4000)
     arangeS  = np.arange(S)
     prev_los = None
@@ -250,9 +275,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     # fitness + descriptor accumulators
     # descriptors: mean gimbal angle, activation variance
     fitness     = np.zeros((N, S))
-    track_velo  = np.zeros((N, S))   # alpha-scaled track sum (running)
-    effort_velo = np.zeros((N, S))   # (1-alpha)-scaled effort sum (running)
-    alpha = 0.7
+    track_velo  = np.zeros((N, S))   # raw track sum, sum(dt * track)
+    effort_velo = np.zeros((N, S))   # raw effort sum, sum(dt * effort)
+    scale_velo  = np.zeros((N, S))   # scaling sum, sum(dt * prox * pretouch_scale)
     sum_acti  = np.zeros((N, 4, S))
     sum_acti2 = np.zeros((N, 4, S))
     mean_gimb = np.zeros(N)
@@ -265,18 +290,40 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
             if event.type == pg.QUIT:
                 quit_early = True
                 break
+            if event.type == pg.KEYDOWN and event.key == pg.K_t:
+                global RANDOM_SEED_MODE
+                RANDOM_SEED_MODE = not RANDOM_SEED_MODE
+            if event.type == pg.KEYDOWN and event.key == pg.K_f:
+                global FOLLOW_DRONE
+                FOLLOW_DRONE = not FOLLOW_DRONE
+            if event.type == pg.KEYDOWN and event.key == pg.K_a:
+                global SHOW_ARROWS
+                SHOW_ARROWS = not SHOW_ARROWS
         if quit_early:
             break
 
-        # UPDATE PHYSICS
-        state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+        # alive mask — see sim1.py for rationale. fully-dead drones are skipped from
+        # physics + brain to save compute.
+        alive_drones = ~crashed.all(axis=1)
+        if not alive_drones.any():
+            break
+        all_alive = bool(alive_drones.all())
 
-        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness
-        mask   = rng.random(S) < impulse_prob
-        v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
-        w_kick = rng.normal(0, impulse_w_sigma, S) * mask
-        state_matrix[:, 1, :] += v_kick
-        state_matrix[:, 3, :] += w_kick
+        # UPDATE PHYSICS — full batch when nothing's dead, otherwise alive subset only.
+        if all_alive:
+            state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+        else:
+            sub_state = physics_update(dt, state_matrix[alive_drones], action_matrix[alive_drones], drone_conf)
+            state_matrix[alive_drones] = sub_state
+
+        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness.
+        # gated by perturbations flag.
+        if perturbations:
+            mask   = rng.random(S) < impulse_prob
+            v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
+            w_kick = rng.normal(0, impulse_w_sigma, S) * mask
+            state_matrix[:, 1, :] += v_kick
+            state_matrix[:, 3, :] += w_kick
 
         # per-(drone, trial) target — clamp ticks to last chain entry per trial
         idx = np.minimum(ticks, tick_pos.shape[1] - 1)           # (N, S)
@@ -337,8 +384,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         ang_vel   = state_matrix[:, 3, :].real
         t1_ang    = state_matrix[:, 4, :].real
         t2_ang    = state_matrix[:, 5, :].real
-        t1_thrust = action_matrix[:, 0, :]
-        t2_thrust = action_matrix[:, 1, :]
+        # actual integrated thrust level (not the command); rescaled [0,1]->[-1,1] to match tanh
+        t1_thrust = 2.0 * state_matrix[:, 6, :].real - 1.0
+        t2_thrust = 2.0 * state_matrix[:, 6, :].imag - 1.0
 
         obs = np.stack([
             dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
@@ -351,12 +399,21 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
             t1_ang, t2_ang, t1_thrust, t2_thrust,
         ], axis=1)  # (N, 27, S)
 
-        action_matrix = Brain.forward(obs)  # (N, 4, S)
+        # pass alive mask so brain skips fully-dead drones; their outputs hold last tick's.
+        if all_alive:
+            action_matrix = Brain.forward(obs)  # (N, 4, S)
+        else:
+            action_matrix = Brain.forward(obs, alive=alive_drones, prev_actions=action_matrix)
 
         # PROGRESS SIMULATION
         toggle |= dist < 0.5
 
-        # FITNESS (tracking x effort, mirror sim1.py) -------------------------------------
+        # crash detection (latched): drone has flown more than crash_dist away from target.
+        # zero crash tolerance: any (drone, seed) pair that ever crashes gets its FULL
+        # episode total zeroed at the end of the sim — not just post-crash ticks.
+        crashed |= dist > crash_dist
+
+        # FITNESS (track * effort * prox, mirror sim1.py) ---------------------------------
         # SHARED ideal velocity (used by both components)
         v_tgt_par    = (v_target * np.conj(los_u)).real
         safe_v       = 0.8 * np.sqrt(2 * max_a * (dist + eps_d))
@@ -367,29 +424,34 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         # TRACKING component (vratio): achieved velocity vs ideal_vel
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
         track_scale = np.maximum(np.abs(ideal_vel), floor)
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, -0.2, 1.0)
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
 
-        # EFFORT component: best-effort reachable velocity v_be toward ideal_vel, dv-scaled
+        # EFFORT component (regime-aware projection match) — mirrors sim1.py
         v_free = prev_vel + -9.81j * dt
-        dv = max_a * dt
-        err_v   = ideal_vel - v_free
-        err_mag = np.abs(err_v)
-        step    = np.minimum(err_mag, dv)
-        v_be    = v_free + step * (err_v / (err_mag + eps))
+        # per-tick dv budget scaled by rate-limited throttle delta (mirrors sim1.py)
+        dv = max_a * dt * (drone_conf['th_actuation_rate'] * dt)
 
-        prev_vel = vel_world
-        effort_err = np.abs(state_matrix[:, 1, :] - v_be)
-        effort = np.clip(1.0 - (effort_err / dv) ** 2, -0.05, 1.0)
+        err_v    = ideal_vel - v_free
+        err_mag  = np.abs(err_v)
+        err_unit = err_v / (err_mag + eps)
 
-        # FINAL = alpha-weighted sum of track and effort (matches sim1.py)
-        prox = 1.0 / (1.0 + np.sqrt(dist))
-        pretouch_scale = np.where(toggle, 1.0, 0.1)
-        track_term  = alpha * track * prox * pretouch_scale
-        effort_term = (1.0 - alpha) * effort * prox * pretouch_scale
-        score = track_term + effort_term
+        actual_dv        = state_matrix[:, 1, :] - v_free
+        projection       = (actual_dv * np.conjugate(err_unit)).real
+        ideal_projection = np.minimum(err_mag, dv)
+        effort_divisor   = np.maximum(ideal_projection, effort_floor)
+
+        prev_vel   = vel_world
+        effort_err = projection - ideal_projection
+        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
+
+        # FINAL = track * effort * prox * pretouch_scale (matches sim1.py)
+        prox = np.exp(-prox_k * dist)
+        pretouch_scale = np.where(toggle, 1.0, 0.05)
+        score = track * effort * prox * pretouch_scale
         fitness     += dt * score
-        track_velo  += dt * track_term
-        effort_velo += dt * effort_term
+        track_velo  += dt * track                       # raw track quality
+        effort_velo += dt * effort                      # raw effort quality
+        scale_velo  += dt * prox * pretouch_scale       # combined scaling
 
         # descriptors
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
@@ -407,10 +469,13 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
         action_t0 = action_matrix[:, :, 0]
         target_t0 = target[:, 0]
 
-        # camera follows the highlighted (main) drone — recenter on its trial-0 position
+        # camera follows either the highlighted drone or its current target. toggled with F.
         global CAMERA
         if highlight is not None:
-            CAMERA = complex(state_t0[highlight, 0])
+            if FOLLOW_DRONE:
+                CAMERA = complex(state_t0[highlight, 0])
+            else:
+                CAMERA = complex(target_t0[highlight])
 
         # particles + draw
         spawn_thruster_particles(particles, state_t0, action_t0, drone_conf, [highlight])
@@ -459,50 +524,56 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
             tx, ty = world_to_screen(target_t0[highlight])
             pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
 
-            # scoring vectors for the highlighted drone (trial 0):
-            base_pos = state_t0[highlight, 0]
-            cur_v = state_matrix[highlight, 1, 0]
-            VS  = 0.4   # shared velocity scale
-            AMP = 5.0   # amplify the tiny per-tick thrust impulses so they're visible
-            draw_vector(screen, base_pos, ideal_vel[highlight, 0], (230, 90, 220), scale=VS)  # ideal (pre-cap)
-            draw_vector(screen, base_pos, cur_v,                   (80, 200, 255), scale=VS)  # current v
+            # scoring vectors for the highlighted drone (trial 0) — gated by SHOW_ARROWS (A).
+            if SHOW_ARROWS:
+                base_pos = state_t0[highlight, 0]
+                cur_v = state_matrix[highlight, 1, 0]
+                VS  = 0.4   # shared velocity scale
+                AMP = 5.0   # amplify the tiny per-tick thrust impulses so they're visible
+                draw_vector(screen, base_pos, ideal_vel[highlight, 0], (230, 90, 220), scale=VS)  # track target
+                draw_vector(screen, base_pos, cur_v,                   (80, 200, 255), scale=VS)  # current v
 
-            # both impulse arrows are measured from v_free (the do-nothing velocity) so they are
-            # directly comparable thrust impulses: SHOULD = v_be - v_free, DOING = actual thrust.
-            # rooted at the v_free tip; if red overlaps orange the drone thrust optimally.
-            vf   = v_free[highlight, 0]
-            root = base_pos + vf * VS
-            should = (v_be[highlight, 0] - vf) * AMP                      # ideal thrust impulse
-            draw_vector(screen, root, should, (255, 170, 40), scale=VS)
+                # both impulse arrows rooted at the v_free tip — directly comparable.
+                # ORANGE = optimal thrust impulse: err_unit * ideal_projection (= min(|err_v|, dv))
+                # RED    = actual_dv produced this tick. red overlapping orange = perfect effort.
+                vf   = v_free[highlight, 0]
+                root = base_pos + vf * VS
+                ideal_dv = err_unit[highlight, 0] * ideal_projection[highlight, 0] * AMP
+                draw_vector(screen, root, ideal_dv, (255, 170, 40), scale=VS)
 
-            act  = action_t0[highlight]
-            ht1  = state_t0[highlight, 4].real
-            ht2  = state_t0[highlight, 5].real
-            hang = state_t0[highlight, 2].real
-            F_body   = (max(0.0, float(act[0])) * drone_conf['th_force']) * (1j * np.exp(1j * ht1)) \
-                     + (max(0.0, float(act[1])) * drone_conf['th_force']) * (1j * np.exp(1j * ht2))
-            a_thrust = (F_body * np.exp(1j * hang)) / drone_conf['M']     # world-frame thrust accel
-            a_net    = a_thrust - 1j * drone_conf['G']                    # net accel = thrust + gravity
-            doing = (a_net * dt) * AMP                                    # actual net dv this tick
-            draw_vector(screen, root, doing, (255, 80, 80), scale=VS)
+                doing = actual_dv[highlight, 0] * AMP
+                draw_vector(screen, root, doing, (255, 80, 80), scale=VS)
 
-            screen.blit(font.render("current v", True, (80, 200, 255)), (10, 40))
-            screen.blit(font.render("should thrust (v_be - v_free)", True, (255, 170, 40)), (10, 64))
-            screen.blit(font.render("actual net accel this tick", True, (255, 80, 80)), (10, 88))
-            screen.blit(font.render("ideal v (pre-cap)", True, (230, 90, 220)), (10, 112))
+                screen.blit(font.render("current v", True, (80, 200, 255)), (10, 40))
+                screen.blit(font.render("ideal dv (err_unit * ideal_proj)", True, (255, 170, 40)), (10, 64))
+                screen.blit(font.render("actual dv this tick", True, (255, 80, 80)), (10, 88))
+                screen.blit(font.render("ideal v (track target)", True, (230, 90, 220)), (10, 112))
 
         fps = clock.get_fps()
-        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}", True, (150, 150, 150)), (10, 10))
-        # highlighted drone's running fitness components (mean over seeds, alpha-scaled)
+        # tooltips describe what pressing the key would do FROM the current mode.
+        seed_label = ("random",  "T: replay current") if RANDOM_SEED_MODE else ("current", "T: randomize")
+        cam_label  = ("drone",   "F: follow target")  if FOLLOW_DRONE    else ("target",  "F: follow drone")
+        arrow_label= ("on",      "A: hide arrows")    if SHOW_ARROWS     else ("off",     "A: show arrows")
+        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}  seed: {seed_label[0]} [{seed_label[1]}]  cam: {cam_label[0]} [{cam_label[1]}]  arrows: {arrow_label[0]} [{arrow_label[1]}]", True, (150, 150, 150)), (10, 10))
+        # highlighted drone's running fitness components (mean over seeds, raw quality)
         hi_track  = float(track_velo [highlight].mean())
         hi_effort = float(effort_velo[highlight].mean())
-        hi_total  = hi_track + hi_effort
-        screen.blit(font.render(f"track: {hi_track:.2f}  effort: {hi_effort:.2f}  total: {hi_total:.2f}", True, (180, 180, 180)), (10, 136))
+        hi_scale  = float(scale_velo [highlight].mean())
+        hi_fit    = float(fitness    [highlight].mean())
+        screen.blit(font.render(f"track: {hi_track:.2f}  effort: {hi_effort:.2f}  scale: {hi_scale:.2f}  fitness: {hi_fit:.2f}", True, (180, 180, 180)), (10, 136))
 
         pg.display.flip()
         clock.tick(max(1, int(60 / PLAYBACK_SLOWDOWN)))
 
     pg.quit()
+
+    # zero crash tolerance: any (drone, seed) pair that ever crashed gets its full
+    # episode contribution wiped — fitness, track, effort, scale all set to 0.
+    survived = (~crashed).astype(np.float32)
+    fitness     *= survived
+    track_velo  *= survived
+    effort_velo *= survived
+    scale_velo  *= survived
 
     if total_ticks > 0:
         var_acti  = (sum_acti2 / total_ticks) - (sum_acti / total_ticks) ** 2  # (N, 4, S)
@@ -511,9 +582,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None) -> di
     else:
         var_acti = np.zeros(N)
 
-    for i, ind in enumerate(individuals):
-        ind.fitness = fitness[i, :].mean()
-        ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
+    if update_fitness:
+        for i, ind in enumerate(individuals):
+            ind.fitness = fitness[i, :].mean()
+            ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
     return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}
 
@@ -523,7 +595,7 @@ if __name__ == "__main__":
     from modules.evo_alg.mapElites import load
 
     save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
-    alg, settings, _ = load(save_path)
+    alg, settings, seed = load(save_path)
 
     # 3x3 coarse bin → best elite per bin (featured, full sprite),
     # everything else → ghost line art.
@@ -548,7 +620,11 @@ if __name__ == "__main__":
     print(f"loaded {len(elites)} elites ({len(featured_set)} featured) from {save_path} (gen {alg.gen})")
     print(f"settings: {settings}")
     try:
+        # mode controlled by RANDOM_SEED_MODE (toggled in-visual with the T key).
+        # False  -> replay the checkpoint seed every loop (same scenario, same drones)
+        # True   -> fresh random seed every loop (new scenarios)
         while True:
-            sim(elites, settings, featured=featured_idx)
+            playback_seed = None if RANDOM_SEED_MODE else seed
+            sim(elites, settings, seed=playback_seed, featured=featured_idx, update_fitness=False)
     except KeyboardInterrupt:
         pass

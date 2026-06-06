@@ -44,9 +44,41 @@ class brain():
             weight_start = weight_end
             bias_start = bias_end
 
-    def forward(self, obs: np.ndarray):
+    def forward(self, obs: np.ndarray, alive: np.ndarray | None = None, prev_actions: np.ndarray | None = None):
+        """Forward pass over a batched obs tensor.
+
+        obs:          (N, in, S)   observations per (drone, seed) pair
+        alive:        (N,) bool    optional per-drone alive mask. when given and not all
+                                   True, only alive drones are processed; dead drones keep
+                                   their `prev_actions` outputs (or zero if not provided).
+        prev_actions: (N, out, S)  last tick's actions, used as the kept output for dead drones.
+        """
         assert obs.ndim == 3, f"obs must be 3D (n, observations, k), got shape {obs.shape}"
         layers = len(self.weights)
+
+        # if any drone is fully dead, run the forward pass on the alive subset only.
+        # the weights are (N, out, in), biases (N, out) — slicing along axis 0 gives the
+        # smaller batch in one copy, then the matmul handles the reduced N naturally.
+        if alive is not None and not alive.all():
+            x = obs[alive]                              # (N_alive, in, S)
+            ws = [W[alive] for W in self.weights]
+            bs = [b[alive] for b in self.biases]
+            for i, (W, b) in enumerate(zip(ws, bs)):
+                x = W @ x + b[:, :, np.newaxis]
+                if i < layers - 1:
+                    x = leaky_relu(x)
+                else:
+                    x[:, :2, :] = sigmoid(x[:, :2, :])
+                    x[:, 2:, :] = np.tanh(x[:, 2:, :])
+            # scatter back into a full (N, out, S) tensor; dead drones get prev_actions (or 0)
+            if prev_actions is not None:
+                full = prev_actions.copy()
+            else:
+                full = np.zeros((obs.shape[0], x.shape[1], obs.shape[2]), dtype=x.dtype)
+            full[alive] = x
+            return full
+
+        # full-batch path (all drones alive, or no alive mask given)
         x = obs # ( n , observations, k ) n = drones, k = observations per drone
         for i,(W, b) in enumerate(zip(self.weights, self.biases)):
             x = W @ x                                  # (n, out, in) @ (n, in, k)

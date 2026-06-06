@@ -21,7 +21,9 @@ def get_drone_conf(path) -> 'dict':
         'th_offset'         : drone_config['thruster_offset'],
         'th_rotation_speed' : drone_config['thruster_rotation_speed'],
         'th_max_angle'      : drone_config['thruster_max_angle'],
-        'th_force'          : drone_config['thruster_force']
+        'th_force'          : drone_config['thruster_force'],
+        # convert throttle_rate (seconds for full sweep) -> rate (1/s)
+        'th_actuation_rate' : 1.0 / drone_config['throttle_rate'],
     }
     return drone
 
@@ -32,16 +34,16 @@ def get_drone_conf(path) -> 'dict':
 # 3. angular vel
 # 4. t1 angle
 # 5. t2 angle
-state = [0+0j, 0+0j, 0, 0, 0, 0]
+# 6. t1 thrust level + i * t2 thrust level (each clipped to [0, 1], fraction of th_force)
+state = [0+0j, 0+0j, 0, 0, 0, 0, 0+0j]
 
 # physics state matrix + actions matrix -> updated state
 def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict):
     assert state.ndim   == 3, f"state must be 3D (n, state, S), got shape {state.shape}"
     assert actions.ndim == 3, f"actions must be 3D (n, action, S), got shape {actions.shape}"
 
-    # process actions
-    t1, t2, rot1, rot2 = actions[:, 0, :], actions[:, 1, :], actions[:, 2, :], actions[:, 3, :]
-    t1, t2 = np.maximum(0, t1), np.maximum(0, t2)
+    # process actions — all four are rate commands in [-1, 1] (tanh output)
+    t1_cmd, t2_cmd, rot1, rot2 = actions[:, 0, :], actions[:, 1, :], actions[:, 2, :], actions[:, 3, :]
 
     # calculate forces (drone refrence frame) --------------------
     rotation_speed = float(np.deg2rad(drone_conf['th_rotation_speed']))
@@ -53,10 +55,17 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
     state[:, 4, :] = np.clip(state[:, 4, :].real, -max_angle, max_angle) # type:ignore
     state[:, 5, :] = np.clip(state[:, 5, :].real, -max_angle, max_angle) # type:ignore
 
+    # THROTTLE — rate-command thrust level, mirrors gimbal handling.
+    # state[:, 6] packs both thruster levels: real=t1, imag=t2, each in [0, 1].
+    actuation_rate = drone_conf['th_actuation_rate']
+    cur_t1 = np.clip(state[:, 6, :].real + actuation_rate * t1_cmd * dt, 0.0, 1.0)
+    cur_t2 = np.clip(state[:, 6, :].imag + actuation_rate * t2_cmd * dt, 0.0, 1.0)
+    state[:, 6, :] = cur_t1 + 1j * cur_t2
+
     # THRUST
     # magnitude
-    thrust1 = t1 * drone_conf['th_force']
-    thrust2 = t2 * drone_conf['th_force']
+    thrust1 = cur_t1 * drone_conf['th_force']
+    thrust2 = cur_t2 * drone_conf['th_force']
 
     # vector
     thrust1dir: np.ndarray = 1j * np.exp(1j * state[:, 4, :])
@@ -89,17 +98,21 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
 
     return state
 
-def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
-    # purpose: to map every tick in sim to the position of target after touch
+def gen_target_chain(length, limit, dt, rng, S, base_S=16) -> np.ndarray:
+    # purpose: to map every tick in sim to the position of target after touch.
+    # all rng draws are sized to `base_S` (default 16, matching sim1.py's training S) so
+    # the rng state advances identically regardless of the actual S requested. trials
+    # 0..S-1 are then byte-identical across callers that request different S values
+    # with the same seed (e.g., training S=16, visual S=4).
+    assert S <= base_S, f"S ({S}) must be <= base_S ({base_S})"
+
     n_segments = 5
     n_points   = n_segments + 1   # origin -> wp1 + motion segments
 
     # path length + speed -------------
     alpha = 3.0
     concentration = 15
-    lengths = rng.dirichlet([alpha] * n_points, size=S)          # including origin -> wp1 (S, segments + 1)
-    # have to do manual dirclet for times cuz no brodcasting for this func
-    # times   = rng.dirichlet(lengths[1:] * concentration)         # NOT including origin -> wp1 (S, segments)
+    lengths = rng.dirichlet([alpha] * n_points, size=base_S)      # (base_S, segments + 1)
     alphas  = lengths[:, 1:] * concentration   # NOT including origin -> wp1
     g       = rng.gamma(alphas, 1.0)
     times   = g / g.sum(axis=1, keepdims=True)
@@ -116,16 +129,22 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
     kappas  = np.array([m['kappa']  for m in maneuvers.values()])
 
     # pick a maneuver per segment, returns from 0 - n segments
-    choice = rng.choice(len(maneuvers), size=(S, n_segments), p=weights / weights.sum())
+    choice = rng.choice(len(maneuvers), size=(base_S, n_segments), p=weights / weights.sum())
 
     # remove left/right bias
-    sign = rng.choice([-1.0, 1.0], size=(S, n_segments))
+    sign = rng.choice([-1.0, 1.0], size=(base_S, n_segments))
     deltas = sign * rng.vonmises(mu=mus[choice], kappa=kappas[choice])
 
     # add to angles
-    angles = np.empty((S, n_points))
-    angles[:, 0]  = rng.uniform(-np.pi, np.pi, size=S)  # initial heading is free
+    angles = np.empty((base_S, n_points))
+    angles[:, 0]  = rng.uniform(-np.pi, np.pi, size=base_S)  # initial heading is free
     angles[:, 1:] = angles[:, 0:1] + np.cumsum(deltas, axis=1)      # deltas is -1 than angles
+
+    # truncate to requested S now that all rng draws are done. trials 0..S-1 are identical
+    # to whatever a larger-S caller would have gotten from the same seed.
+    lengths = lengths[:S]
+    times   = times[:S]
+    angles  = angles[:S]
 
     # normalize --------------------------------------------------------------
     # motion fills n_segments / n_points of the timeline (origin->wp1 is non-moving)
@@ -171,38 +190,58 @@ def gen_target_chain(length, limit, dt, rng, S) -> np.ndarray:
 
 
 # individuals + sim settings -> simulation stats
-def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Individual], dict]:
+def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool = False) -> tuple[list[Individual], dict]:
     # get configuration
     drone_conf = get_drone_conf(config_path)
     N = len(individuals) # drones
-    S = 16                # trials per drone
+    S = 32                # trials per drone
     dt = .016
+
+    # per-tick logging buffers (diagnostic only). when enabled, each tick's
+    # raw increments (dt * track, dt * effort, dt * prox*pretouch, dt * score)
+    # are stored so downstream tools can plot signal traces.
+    if log_per_tick:
+        T_alloc = int(np.ceil(settings['limit'] / dt))
+        tick_fit    = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_track  = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_effort = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_scale  = np.zeros((N, S, T_alloc), dtype=np.float32)
 
     # initialize targets
     rng = np.random.default_rng(seed)
     # get the target position every tick
-    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S).astype(np.complex64)
+    tick_pos: np.ndarray = gen_target_chain(settings['length'], settings['limit'], dt, rng, S, base_S=S).astype(np.complex64)
 
     # init brain
     Brain = brain(individuals)
 
     # have physics states of all drones in one matrix
-    # rows are drones, columns is state values
-    # randomized init, identical across drones on this seed
-    angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
-    ang_vel0 = rng.uniform(-2.0, 2.0)
+    # rows are drones, columns is state values.
+    # perturbations flag (settings) gates init randomization + wind gusts. when False,
+    # drones spawn at origin with zero velocity/angle/spin (clean state) and no gusts.
+    perturbations = settings.get('perturbations', False)
 
-    v_init_max = 3
-    v_mag = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
-    v_dir = rng.uniform(-np.pi, np.pi)
-    vel0  = v_mag * np.exp(1j * v_dir)
-
-    state_matrix = np.zeros((N, 6, S), dtype=np.complex64)
+    state_matrix = np.zeros((N, 7, S), dtype=np.complex64)
     state_matrix[:, 0, :] = 0j         # spawn at origin
-    state_matrix[:, 1, :] = vel0
-    state_matrix[:, 2, :] = angle0
-    state_matrix[:, 3, :] = ang_vel0
+    # pre-spool throttles to hover so random policies start in a viable regime.
+    # neutral op point for rate-command thrust is gravity-matching, not zero.
+    hover = drone_conf['M'] * abs(drone_conf['G']) / (2 * drone_conf['th_force'])
+    state_matrix[:, 6, :] = hover + 1j * hover
     # columns 4, 5 (thruster angles) stay 0
+
+    if perturbations:
+        # randomized init, identical across drones on this seed
+        angle0   = rng.uniform(-np.deg2rad(60), np.deg2rad(60))
+        ang_vel0 = rng.uniform(-2.0, 2.0)
+
+        v_init_max = 3
+        v_mag = np.sqrt(rng.uniform(0, 1)) * v_init_max   # sqrt -> uniform 2D disk
+        v_dir = rng.uniform(-np.pi, np.pi)
+        vel0  = v_mag * np.exp(1j * v_dir)
+
+        state_matrix[:, 1, :] = vel0
+        state_matrix[:, 2, :] = angle0
+        state_matrix[:, 3, :] = ang_vel0
 
     # impulse (wind gust) params — per-tick prob set so ~4 kicks happen per episode on average
     impulse_prob    = 4 * dt / settings['limit']
@@ -215,12 +254,15 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     # simulation progression arrays
     toggle  = np.zeros((N, S), dtype=bool) # tracks initial touch to start chain
     ticks   = np.zeros((N, S), dtype=int) # ticks since touched
+    crashed = np.zeros((N, S), dtype=bool) # latched flag: drone has flown out of bounds; zeros all future fitness
+    crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
 
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
     fitness_velo  = np.zeros((N, S), dtype=np.float32)
-    track_velo    = np.zeros((N, S), dtype=np.float32)  # diagnostic: alpha-scaled track sum
-    effort_velo   = np.zeros((N, S), dtype=np.float32)  # diagnostic: (1-alpha)-scaled effort sum
+    track_velo    = np.zeros((N, S), dtype=np.float32)  # diagnostic: raw track sum, sum(dt * track)
+    effort_velo   = np.zeros((N, S), dtype=np.float32)  # diagnostic: raw effort sum, sum(dt * effort)
+    scale_velo    = np.zeros((N, S), dtype=np.float32)  # diagnostic: scaling sum, sum(dt * prox * pretouch_scale)
     sum_acti2    = np.zeros((N, 4, S), dtype=np.float32)
     sum_acti     = np.zeros((N, 4, S), dtype=np.float32)
     mean_gimb    = np.zeros(N,         dtype=np.float32)
@@ -229,7 +271,9 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']
     eps   = 1e-8
     eps_d = 0.05
-    floor = 0.5   # hover tolerance for the tracking scale, m/s
+    floor = 0.5    # hover tolerance for the tracking scale, m/s
+    effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
+    prox_k = 3.0 * np.log(2.0) / settings['length']  # exp decay constant: half-credit at dist = L/3
 
     # prenitialize values
     prev_los   = None
@@ -240,15 +284,28 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
     arangeS    = np.arange(S)
     norm_const = np.array([1, 1, 2, 2], dtype=np.float32).reshape(1, 4, 1)
     while time < settings['limit']:
-        # UPDATE PHYSICS
-        state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+        # alive mask: a drone is "alive" if at least one of its S seeds hasn't crashed.
+        # fully-dead drones are skipped from physics + brain to save compute.
+        alive_drones = ~crashed.all(axis=1)              # (N,) bool
+        if not alive_drones.any():
+            break                                         # whole population crashed, stop sim
+        all_alive = bool(alive_drones.all())
 
-        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness
-        mask   = rng.random(S) < impulse_prob
-        v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
-        w_kick = rng.normal(0, impulse_w_sigma, S) * mask
-        state_matrix[:, 1, :] += v_kick
-        state_matrix[:, 3, :] += w_kick
+        # UPDATE PHYSICS — full batch when nothing's dead, otherwise on the alive subset.
+        if all_alive:
+            state_matrix = physics_update(dt, state_matrix, action_matrix, drone_conf)
+        else:
+            sub_state = physics_update(dt, state_matrix[alive_drones], action_matrix[alive_drones], drone_conf)
+            state_matrix[alive_drones] = sub_state
+
+        # RANDOM IMPULSES (wind gusts) — shared across drones within a seed for fairness.
+        # gated by perturbations flag; disabled gives clean trajectories with no external kicks.
+        if perturbations:
+            mask   = rng.random(S) < impulse_prob
+            v_kick = (rng.normal(0, impulse_v_sigma, S) + 1j * rng.normal(0, impulse_v_sigma, S)) * mask
+            w_kick = rng.normal(0, impulse_w_sigma, S) * mask
+            state_matrix[:, 1, :] += v_kick
+            state_matrix[:, 3, :] += w_kick
 
         # MAKE OBSERVATION ARRAY -----------------------------------------------------------
         # obs values (27)  -- each vector as [magnitude, unit_x, unit_y]; frame in []
@@ -319,8 +376,10 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         ang_vel   = state_matrix[:, 3, :].real # type:ignore
         t1_ang    = state_matrix[:, 4, :].real # type:ignore
         t2_ang    = state_matrix[:, 5, :].real # type:ignore
-        t1_thrust = action_matrix[:, 0, :]     # last tick's thrust commands
-        t2_thrust = action_matrix[:, 1, :]
+        # actual integrated thrust level (not the command) — what the drone is actually feeling.
+        # rescale [0, 1] -> [-1, 1] to match the tanh output scale on the same channels.
+        t1_thrust = 2.0 * state_matrix[:, 6, :].real - 1.0
+        t2_thrust = 2.0 * state_matrix[:, 6, :].imag - 1.0
 
         obs = np.stack([
             dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
@@ -334,11 +393,20 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         ], axis=1) # have to have 3 dim for forward pass (N, inputs, S)
 
         # FORWARD PASS OBSERVATIONS --------------------------------------------------------
-        action_matrix = Brain.forward(obs)
+        # pass alive mask so brain skips fully-dead drones; their outputs hold last tick's.
+        if all_alive:
+            action_matrix = Brain.forward(obs)
+        else:
+            action_matrix = Brain.forward(obs, alive=alive_drones, prev_actions=action_matrix)
 
         # PROGRESS SIMULATION --------------------------------------------------------------
         # check if touched waypoint
         toggle |= dist < 0.5
+
+        # crash detection (latched): drone has flown more than crash_dist away from target.
+        # zero crash tolerance: any (drone, seed) pair that ever crashes gets its FULL
+        # episode total zeroed at the end of the sim — not just post-crash ticks.
+        crashed |= dist > crash_dist
 
         # FITNESS CALULATIONS --------------------------------------------------------------
         # SHARED: ideal drone vel VECTOR = match target motion + approach budget along los_u.
@@ -359,43 +427,49 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         # high-level goal so the drone cant farm effort points from a self-made bad state.
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
         track_scale = np.maximum(np.abs(ideal_vel), floor)  # floored for hover
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, -0.2, 1.0)
+        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
 
-        # EFFORT component (directional thrust efficiency) ----------------------------------
-        # best-effort direction = unit vector from v_free toward ideal_vel. actual_dv is the
-        # velocity change from thrust alone this tick (gravity already baked into v_free).
-        # score = projection of actual_dv onto best-effort direction, normalized to dv.
-        # rewards using the dv budget in the right direction; small negative penalty for
-        # thrust pointed against the best-effort direction.
+        # EFFORT component (regime-aware projection match) ----------------------------------
+        # ideal_projection = how much actual_dv SHOULD project along err_unit this tick
+        # (capped at dv budget). divisor floors at effort_floor so near-equilibrium ticks
+        # dont demand impossible precision. penalizes both over- and under-shoot equally.
         v_free = prev_vel + -9.81j * dt
-        dv = max_a * dt # the delta v budget for this tick
+        # per-tick dv budget scaled by how much throttle can actually change this tick.
+        # actuation_rate * dt = fraction of max thrust the rate-limited actuator can swing
+        # in one tick; multiplying max_a*dt by it gives the realistically achievable dv.
+        dv = max_a * dt * (drone_conf['th_actuation_rate'] * dt)
 
         err_v    = ideal_vel - v_free
         err_mag  = np.abs(err_v)
         err_unit = err_v / (err_mag + eps)
 
-        actual_dv  = state_matrix[:, 1, :] - v_free
-        projection = (actual_dv * np.conjugate(err_unit)).real
+        actual_dv        = state_matrix[:, 1, :] - v_free
+        projection       = (actual_dv * np.conjugate(err_unit)).real
+        ideal_projection = np.minimum(err_mag, dv)
+        effort_divisor   = np.maximum(ideal_projection, effort_floor)
 
-        prev_vel = vel_world
-        effort = np.clip(projection / dv, -0.1, 1.0)
+        prev_vel   = vel_world
+        effort_err = projection - ideal_projection
+        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
 
-        # FINAL velocity score = alpha-weighted sum of tracking and effort ----------------
-        # sum (not product) avoids double-jeopardy: a bad tick gets penalized once, not squared.
-        # track is the goal-aligned anchor; effort is the shaper biasing search inside the basin.
-        alpha = .5
-        # proximity weight: 1 / (1 + sqrt(dist)). pulls more reward when close to target,
-        # so hovering tight beats coasting far. applied uniformly to both components.
-        prox = 1.0 / (1.0 + dist)
-        # pre-touch scaledown: reward the approach phase at 0.1x so the drone has incentive
+        # FINAL velocity score = track * effort * proximity --------------------------------
+        # pure multiplicative. all three factors in [0, 1]; product peaks at perfect hover at
+        # target (= 1.0). prox: exp decay, half-credit at dist = L/3, scales with chain length.
+        prox = np.exp(-prox_k * dist)
+        # pre-touch scaledown: reward the approach phase at 0.05x so the drone has incentive
         # to find the target but post-touch chain-following dominates fitness.
         pretouch_scale = np.where(toggle, 1.0, 0.05)
-        track_term  = alpha * track * prox * pretouch_scale
-        effort_term = (1.0 - alpha) * effort * prox * pretouch_scale
-        score = track_term + effort_term
-        fitness_velo += dt * score        # (N, S)
-        track_velo   += dt * track_term   # diagnostic: alpha-scaled track contribution
-        effort_velo  += dt * effort_term  # diagnostic: (1-alpha)-scaled effort contribution
+        score = track * effort * prox * pretouch_scale
+        fitness_velo += dt * score                          # (N, S) final fitness
+        track_velo   += dt * track                          # raw track quality (no scaling)
+        effort_velo  += dt * effort                         # raw effort quality (no scaling)
+        scale_velo   += dt * prox * pretouch_scale          # combined scaling (prox * pretouch)
+
+        if log_per_tick:
+            tick_fit   [:, :, total_ticks] = dt * score
+            tick_track [:, :, total_ticks] = dt * track
+            tick_effort[:, :, total_ticks] = dt * effort
+            tick_scale [:, :, total_ticks] = dt * prox * pretouch_scale
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
@@ -409,6 +483,14 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         total_ticks += 1
 
         time += dt
+
+    # zero crash tolerance: any (drone, seed) pair that ever crashed gets its full
+    # episode contribution wiped — fitness, track, effort, scale all set to 0.
+    survived = (~crashed).astype(np.float32)
+    fitness_velo *= survived
+    track_velo   *= survived
+    effort_velo  *= survived
+    scale_velo   *= survived
 
     # finalize descriptors and fitness
     var_acti = (sum_acti2 / total_ticks) - (sum_acti / total_ticks)**2 # (N, act, S)
@@ -428,12 +510,25 @@ def sim(individuals: list[Individual], settings, seed=None) -> tuple[list[Indivi
         ind.fitness = fitness[i, :].mean()
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
-    return individuals, {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max(),
-                         'fit_velo': fitness_velo.mean(),
-                         # per-drone arrays (mean over seeds) so parallel_sim can pick a global top-K
-                         'per_fit'   : fitness.mean(axis=1),
-                         'per_track' : track_velo.mean(axis=1),
-                         'per_effort': effort_velo.mean(axis=1)}
+    stats_out = {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max(),
+                 'fit_velo': fitness_velo.mean(),
+                 # per-drone arrays (mean over seeds) so parallel_sim can pick a global top-K
+                 'per_fit'    : fitness.mean(axis=1),
+                 'per_track'  : track_velo.mean(axis=1),
+                 'per_effort' : effort_velo.mean(axis=1),
+                 'per_scale'  : scale_velo.mean(axis=1),
+                 'per_fit_std': fitness.std(axis=1),
+                 'S'          : S}
+
+    if log_per_tick:
+        # trim to actual ticks executed (in case loop exited early via all-crashed break)
+        stats_out['tick_fit']    = tick_fit   [:, :, :total_ticks]
+        stats_out['tick_track']  = tick_track [:, :, :total_ticks]
+        stats_out['tick_effort'] = tick_effort[:, :, :total_ticks]
+        stats_out['tick_scale']  = tick_scale [:, :, :total_ticks]
+        stats_out['dt']          = dt
+
+    return individuals, stats_out
 
 def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> tuple[list[Individual], dict]:
     # get ocpu count
@@ -459,8 +554,10 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
 
     scored = []
     stats  = {'fit_max': -np.inf, 'fit_mean': 0.0, 'fit_velo': 0.0,
-              'fit_track': 0.0, 'fit_effort': 0.0}
-    per_fit_all, per_track_all, per_effort_all = [], [], []
+              'fit_track': 0.0, 'fit_effort': 0.0, 'fit_scale': 0.0}
+    per_fit_all, per_track_all, per_effort_all, per_scale_all = [], [], [], []
+    per_fit_std_all = []
+    S_val = None
     for indvs, stat in chunk_results:
         scored.extend(indvs)
         stats['fit_mean']   += stat['fit_mean']
@@ -469,20 +566,33 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
         per_fit_all   .append(stat['per_fit'])
         per_track_all .append(stat['per_track'])
         per_effort_all.append(stat['per_effort'])
+        per_scale_all .append(stat['per_scale'])
+        per_fit_std_all.append(stat['per_fit_std'])
+        S_val = stat['S']
 
     stats['fit_mean']   /= cpus
     stats['fit_velo']   /= cpus
 
-    # global top 10 by per-drone fitness; report their track/effort means
+    # global top 10 by per-drone fitness; report their raw component means
     per_fit    = np.concatenate(per_fit_all)
     per_track  = np.concatenate(per_track_all)
     per_effort = np.concatenate(per_effort_all)
+    per_scale  = np.concatenate(per_scale_all)
     k = min(10, per_fit.size)
     top10 = np.argpartition(per_fit, -k)[-k:]
     stats['fit_track']  = float(per_track [top10].mean())
     stats['fit_effort'] = float(per_effort[top10].mean())
+    stats['fit_scale']  = float(per_scale  [top10].mean())
 
-    print(f"track, {stats['fit_track']:.2f}, effort, {stats['fit_effort']:.2f}")
+    print(f"track, {stats['fit_track']:.2f}, effort, {stats['fit_effort']:.2f}, scale, {stats['fit_scale']:.2f}")
+
+    per_fit_std = np.concatenate(per_fit_std_all)
+    sem        = (per_fit_std / np.sqrt(S_val)).mean()       # mean across drones of per-drone SEM
+    pop_mean   = per_fit.mean()                              # mean fitness across drones (of seed-mean)
+    cross_std  = per_fit.std()                               # std across drones (of seed-mean)
+    ratio_mean = sem / pop_mean if pop_mean != 0 else float('inf')
+    ratio_std  = sem / cross_std if cross_std != 0 else float('inf')
+    print(f"SEM/pop_mean, {ratio_mean:.3f}, SEM/cross_std, {ratio_std:.3f}, S, {S_val}")
 
     return scored, stats
 

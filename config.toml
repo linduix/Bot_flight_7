@@ -1,10 +1,10 @@
 [network]
-layers = [27, 48, 48, 4]
+layers = [27, 48, 32, 12, 4]
 hidden_activation = "leaky_relu"
 output_activation = "tanh"
 
 [trainer]
-population = 250
+population = 500
 
 [drone]
 mass            = 4.0        # kg
@@ -17,3 +17,4 @@ thruster_offset         = 1.0        # m from center (width / 2)
 thruster_rotation_speed = 120.0      # deg/s
 thruster_max_angle      = 45         # degrees
 thruster_force          = 47.088     # N (g * M * 1.2)
+throttle_rate           = 0.1        # s, time for full 0->max thrust sweep
