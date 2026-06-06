@@ -384,9 +384,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         ang_vel   = state_matrix[:, 3, :].real
         t1_ang    = state_matrix[:, 4, :].real
         t2_ang    = state_matrix[:, 5, :].real
-        # actual integrated thrust level (not the command); rescaled [0,1]->[-1,1] to match tanh
-        t1_thrust = 2.0 * state_matrix[:, 6, :].real - 1.0
-        t2_thrust = 2.0 * state_matrix[:, 6, :].imag - 1.0
+        # actual integrated thrust level (not the command); left in [0,1] to match sigmoid output
+        t1_thrust = state_matrix[:, 6, :].real
+        t2_thrust = state_matrix[:, 6, :].imag
 
         obs = np.stack([
             dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,

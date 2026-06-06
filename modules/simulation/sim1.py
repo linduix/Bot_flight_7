@@ -42,24 +42,30 @@ def physics_update(dt, state: np.ndarray, actions: np.ndarray, drone_conf: dict)
     assert state.ndim   == 3, f"state must be 3D (n, state, S), got shape {state.shape}"
     assert actions.ndim == 3, f"actions must be 3D (n, action, S), got shape {actions.shape}"
 
-    # process actions — all four are rate commands in [-1, 1] (tanh output)
+    # process actions — target-command. throttle outputs sigmoid [0, 1] are target thrust
+    # fractions; gimbal outputs tanh [-1, 1] are target angles scaled by max_angle.
     t1_cmd, t2_cmd, rot1, rot2 = actions[:, 0, :], actions[:, 1, :], actions[:, 2, :], actions[:, 3, :]
 
-    # calculate forces (drone refrence frame) --------------------
+    # GIMBAL — target-command. tanh [-1, 1] -> target angle [-max_angle, +max_angle].
+    # actuator slews toward target at rotation_speed.
     rotation_speed = float(np.deg2rad(drone_conf['th_rotation_speed']))
-    # thruster rotation
-    state[:, 4, :] += rotation_speed * rot1 * dt
-    state[:, 5, :] += rotation_speed * rot2 * dt
-    # ADD ROTATION CLIPPING
-    max_angle = np.deg2rad(drone_conf['th_max_angle'])
-    state[:, 4, :] = np.clip(state[:, 4, :].real, -max_angle, max_angle) # type:ignore
-    state[:, 5, :] = np.clip(state[:, 5, :].real, -max_angle, max_angle) # type:ignore
+    max_angle      = np.deg2rad(drone_conf['th_max_angle'])
+    max_delta_rot  = rotation_speed * dt
+    t1_ang_target  = rot1 * max_angle
+    t2_ang_target  = rot2 * max_angle
+    cur_t1_ang     = state[:, 4, :].real + np.clip(t1_ang_target - state[:, 4, :].real, -max_delta_rot, max_delta_rot)
+    cur_t2_ang     = state[:, 5, :].real + np.clip(t2_ang_target - state[:, 5, :].real, -max_delta_rot, max_delta_rot)
+    state[:, 4, :] = np.clip(cur_t1_ang, -max_angle, max_angle) # type:ignore
+    state[:, 5, :] = np.clip(cur_t2_ang, -max_angle, max_angle) # type:ignore
 
-    # THROTTLE — rate-command thrust level, mirrors gimbal handling.
-    # state[:, 6] packs both thruster levels: real=t1, imag=t2, each in [0, 1].
+    # THROTTLE — target-command. sigmoid [0, 1] IS the target thrust fraction; actuator
+    # slews toward target at actuation_rate. state[:, 6] packs both: real=t1, imag=t2.
     actuation_rate = drone_conf['th_actuation_rate']
-    cur_t1 = np.clip(state[:, 6, :].real + actuation_rate * t1_cmd * dt, 0.0, 1.0)
-    cur_t2 = np.clip(state[:, 6, :].imag + actuation_rate * t2_cmd * dt, 0.0, 1.0)
+    max_delta_thr  = actuation_rate * dt
+    cur_t1 = state[:, 6, :].real + np.clip(t1_cmd - state[:, 6, :].real, -max_delta_thr, max_delta_thr)
+    cur_t2 = state[:, 6, :].imag + np.clip(t2_cmd - state[:, 6, :].imag, -max_delta_thr, max_delta_thr)
+    cur_t1 = np.clip(cur_t1, 0.0, 1.0)
+    cur_t2 = np.clip(cur_t2, 0.0, 1.0)
     state[:, 6, :] = cur_t1 + 1j * cur_t2
 
     # THRUST
@@ -377,9 +383,9 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         t1_ang    = state_matrix[:, 4, :].real # type:ignore
         t2_ang    = state_matrix[:, 5, :].real # type:ignore
         # actual integrated thrust level (not the command) — what the drone is actually feeling.
-        # rescale [0, 1] -> [-1, 1] to match the tanh output scale on the same channels.
-        t1_thrust = 2.0 * state_matrix[:, 6, :].real - 1.0
-        t2_thrust = 2.0 * state_matrix[:, 6, :].imag - 1.0
+        # left in [0, 1] to match the sigmoid output scale on the same channels.
+        t1_thrust = state_matrix[:, 6, :].real
+        t2_thrust = state_matrix[:, 6, :].imag
 
         obs = np.stack([
             dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
