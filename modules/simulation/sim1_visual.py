@@ -213,21 +213,30 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
     N = len(individuals)
     S = 4  # trials per drone — only trial 0 is rendered; rest run "headlessly" so chains can be shown faintly
 
+    # physics MUST step at the same dt the controller was trained on (sim1.py dt=.016),
+    # otherwise the high-gain policy mistimes and flies wonky. render still caps at 60fps;
+    # playback ends up ~0.96x real-time, which is fine.
+    dt = 0.016
+
     # fitness constants (mirror sim1.py)
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']
     eps   = 1e-8
     eps_d = 0.05
     floor = 0.5    # hover tolerance for the tracking scale, m/s
     effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
-    prox_k = 3.0 * np.log(2.0) / settings['length']  # exp decay constant: half-credit at dist = L/3
+
+    # scale shape: f(x) = 1/(K·(x+A)) − A, mirrors sim1.py.
+    SCALE_A = 1.0 / 15.0
+    SCALE_K = 225.0 / 16.0
+    inv_L   = 1.0 / settings['length']
+
+    # criticality gate for effort (mirrors sim1.py). quadratic exponent,
+    # ~closed at hover, ~open at err_mag = 6·max_a·dt.
+    crit_ref  = 6.0 * max_a * dt
+    crit_coef = 6.0 * np.log(2.0) / (crit_ref ** 2)
 
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
-
-    # physics MUST step at the same dt the controller was trained on (sim1.py dt=.016),
-    # otherwise the high-gain policy mistimes and flies wonky. render still caps at 60fps;
-    # playback ends up ~0.96x real-time, which is fine.
-    dt = 0.016
 
     # generated target chains (one per trial, same logic as headless sim)
     rng = np.random.default_rng(seed)
@@ -442,11 +451,17 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
 
         prev_vel   = vel_world
         effort_err = projection - ideal_projection
-        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
+        effort_raw = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
 
-        # FINAL = track * effort * prox * pretouch_scale (matches sim1.py)
-        prox = np.exp(-prox_k * dist)
-        pretouch_scale = np.where(toggle, 1.0, 0.05)
+        # criticality gate (mirrors sim1.py): suppresses effort jiggle during hover.
+        criticality = 1.0 - np.exp(-crit_coef * err_mag * err_mag)
+        effort      = 1.0 - criticality * (1.0 - effort_raw)
+
+        # FINAL = track * effort * prox * pretouch (matches sim1.py raw scoring)
+        x_norm = dist * inv_L
+        prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
+        pretouch_scale = np.where(toggle, 1.0, 1.0)
+
         score = track * effort * prox * pretouch_scale
         fitness     += dt * score
         track_velo  += dt * track                       # raw track quality
@@ -583,8 +598,13 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         var_acti = np.zeros(N)
 
     if update_fitness:
+        # SE-penalized fitness (mean - std/sqrt(S)) — matches sim1.sim's selection metric.
+        # note: visual sim uses S=4 so SE is a coarser estimate than training's S=32.
+        per_seed_mean = fitness.mean(axis=1)
+        per_seed_std  = fitness.std (axis=1)
+        per_drone_fit = per_seed_mean - per_seed_std / np.sqrt(S)
         for i, ind in enumerate(individuals):
-            ind.fitness = fitness[i, :].mean()
+            ind.fitness = float(per_drone_fit[i])
             ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
     return {'fit_mean': fitness.mean(), 'fit_max': fitness.max()}

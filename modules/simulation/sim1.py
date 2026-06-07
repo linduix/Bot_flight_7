@@ -208,10 +208,13 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     # are stored so downstream tools can plot signal traces.
     if log_per_tick:
         T_alloc = int(np.ceil(settings['limit'] / dt))
-        tick_fit    = np.zeros((N, S, T_alloc), dtype=np.float32)
-        tick_track  = np.zeros((N, S, T_alloc), dtype=np.float32)
-        tick_effort = np.zeros((N, S, T_alloc), dtype=np.float32)
-        tick_scale  = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_fit        = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_track      = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_effort     = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_scale      = np.zeros((N, S, T_alloc), dtype=np.float32)
+        tick_track_raw       = np.zeros((N, S, T_alloc), dtype=np.float32)  # pre-EMA
+        tick_effort_raw      = np.zeros((N, S, T_alloc), dtype=np.float32)  # pre-criticality, pre-EMA
+        tick_effort_weighted = np.zeros((N, S, T_alloc), dtype=np.float32)  # post-criticality, pre-EMA
 
     # initialize targets
     rng = np.random.default_rng(seed)
@@ -279,11 +282,31 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     eps_d = 0.05
     floor = 0.5    # hover tolerance for the tracking scale, m/s
     effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
-    prox_k = 3.0 * np.log(2.0) / settings['length']  # exp decay constant: half-credit at dist = L/3
+
+    # scale shape: f(x) = 1/(K·(x+A)) − A   where x = dist/L (normalized).
+    # constants chosen so f(0)=1, f(1)=0, f(0.2)=0.2 — packs the dynamic range
+    # into the hover regime (first 20% of L) so trained drones don't saturate at 1.
+    SCALE_A = 1.0 / 15.0     # ≈ 0.0667
+    SCALE_K = 225.0 / 16.0   # = 14.0625
+    inv_L   = 1.0 / settings['length']
+
+    # criticality gate for the effort score. quadratic exponent so the gate is
+    # ~closed (criticality ≈ 0, effort LERP'd to 1) when err_mag is small (hover,
+    # scale near 1), and ~fully open (criticality ≈ 1, raw effort passes through)
+    # by err_mag = 6·max_a·dt (≈ 6 ticks of full-thrust dv).
+    crit_ref  = 3.0 * max_a * dt
+    crit_coef = 6.0 * np.log(2.0) / (crit_ref ** 2)
 
     # prenitialize values
     prev_los   = None
     prev_vel   = None
+    # single-pole EMA over the track and effort scores (window K=16 ticks ≈ 0.25s).
+    # seeded at 1.0 so a smoothly-controlling drone isn't punished by a startup
+    # transient; bad behavior pulls it down as the EMA mixes in the real values.
+    K_smooth     = 16
+    alpha_smooth = 1.0 / K_smooth
+    ema_effort   = np.ones((N, S), dtype=np.float32)
+    ema_track    = np.ones((N, S), dtype=np.float32)
     time = 0
 
     # hoisted loop constants
@@ -433,7 +456,11 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         # high-level goal so the drone cant farm effort points from a self-made bad state.
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
         track_scale = np.maximum(np.abs(ideal_vel), floor)  # floored for hover
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+        track_raw   = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+
+        # single-pole EMA smoothing — same K as effort, kills hover-wobble chatter.
+        ema_track = alpha_smooth * track_raw + (1.0 - alpha_smooth) * ema_track
+        track = ema_track
 
         # EFFORT component (regime-aware projection match) ----------------------------------
         # ideal_projection = how much actual_dv SHOULD project along err_unit this tick
@@ -456,26 +483,38 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
 
         prev_vel   = vel_world
         effort_err = projection - ideal_projection
-        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
+        effort_raw = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
 
-        # FINAL velocity score = track * effort * proximity --------------------------------
-        # pure multiplicative. all three factors in [0, 1]; product peaks at perfect hover at
-        # target (= 1.0). prox: exp decay, half-credit at dist = L/3, scales with chain length.
-        prox = np.exp(-prox_k * dist)
-        # pre-touch scaledown: reward the approach phase at 0.05x so the drone has incentive
-        # to find the target but post-touch chain-following dominates fitness.
-        pretouch_scale = np.where(toggle, 1.0, 0.05)
-        score = track * effort * prox * pretouch_scale
+        # criticality gate: at small err_mag (hover), criticality ≈ 0 → effort LERP'd
+        # to 1 (suppress floor-artifact jiggle). at err_mag ≈ 6·max_a·dt (real
+        # correction needed), criticality ≈ 0.984 → raw effort passes through.
+        # quadratic exponent keeps the gate flat-near-zero for tiny err.
+        criticality     = 1.0 - np.exp(-crit_coef * err_mag * err_mag)
+        effort_weighted = 1.0 - criticality * (1.0 - effort_raw)
+
+        # single-pole EMA over the gated effort score (matches track smoothing).
+        ema_effort = alpha_smooth * effort_weighted + (1.0 - alpha_smooth) * ema_effort
+        effort = ema_effort
+
+        # FINAL velocity score = track * effort * proximity ------------------------------
+        x_norm = dist * inv_L
+        prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
+        pretouch_scale = np.where(toggle, 1.0, 1.0)
+
+        score = track * effort * prox  * pretouch_scale
         fitness_velo += dt * score                          # (N, S) final fitness
-        track_velo   += dt * track                          # raw track quality (no scaling)
-        effort_velo  += dt * effort                         # raw effort quality (no scaling)
+        track_velo   += dt * track                          # ema-smoothed track quality
+        effort_velo  += dt * effort                         # ema-smoothed effort quality
         scale_velo   += dt * prox * pretouch_scale          # combined scaling (prox * pretouch)
 
         if log_per_tick:
-            tick_fit   [:, :, total_ticks] = dt * score
-            tick_track [:, :, total_ticks] = dt * track
-            tick_effort[:, :, total_ticks] = dt * effort
-            tick_scale [:, :, total_ticks] = dt * prox * pretouch_scale
+            tick_fit            [:, :, total_ticks] = dt * score
+            tick_track          [:, :, total_ticks] = dt * track             # ema-smoothed
+            tick_effort         [:, :, total_ticks] = dt * effort            # ema-smoothed
+            tick_scale          [:, :, total_ticks] = dt * prox * pretouch_scale
+            tick_track_raw      [:, :, total_ticks] = dt * track_raw
+            tick_effort_raw     [:, :, total_ticks] = dt * effort_raw        # pre-criticality
+            tick_effort_weighted[:, :, total_ticks] = dt * effort_weighted   # post-criticality, pre-EMA
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
@@ -507,32 +546,48 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     # fitness = np.maximum(fitness_velo, 0.0)
     fitness = fitness_velo
 
-    top_idx = fitness.mean(axis=1).argsort()[-5:]
+    # per-drone fitness: SE-penalized mean (mean - std/sqrt(S)).
+    # this is the value that drives selection everywhere — archive ranking, bandit
+    # scoring, CMA parent picks, parallel_sim's top-K. drones with consistent good
+    # performance across seeds beat lucky-spike drones. raw per-drone signals
+    # (per_track / per_effort / per_scale / tick_* / fit_mean) stay raw so the
+    # diagnostic plots and trend metrics read uncontaminated.
+    per_seed_mean = fitness.mean(axis=1)                 # raw per-drone mean (N,)
+    per_seed_std  = fitness.std (axis=1)                 # raw per-drone std  (N,)
+    per_drone_fit = per_seed_mean - per_seed_std / np.sqrt(S)
+
+    top_idx = per_drone_fit.argsort()[-5:]
     top = fitness[top_idx, :]
 
     # print(f'in drone std {top.std(axis=1).mean(): .2f}, total std {top.std(): .2f}, cross drone std {top.mean(axis=1).std(): .2f}, arm {individuals[top_idx[-1]].tag}')
 
     for i, ind in enumerate(individuals):
-        ind.fitness = fitness[i, :].mean()
+        ind.fitness = float(per_drone_fit[i])
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
 
-    stats_out = {'fit_mean': fitness.mean(), 'fit_max': fitness.mean(axis=1).max(),
-                 'fit_velo': fitness_velo.mean(),
-                 # per-drone arrays (mean over seeds) so parallel_sim can pick a global top-K
-                 'per_fit'    : fitness.mean(axis=1),
+    stats_out = {'fit_mean'   : fitness.mean(),                      # raw population mean
+                 'fit_max'    : float(per_drone_fit.max()),          # selection-relevant (SE'd)
+                 'fit_velo'   : fitness_velo.mean(),
+                 # per-drone arrays. per_fit is SE form (drives parallel_sim top-K).
+                 # per_fit_raw, per_fit_std, per_track/effort/scale stay raw for diagnostics.
+                 'per_fit'    : per_drone_fit,
+                 'per_fit_raw': per_seed_mean,
+                 'per_fit_std': per_seed_std,
                  'per_track'  : track_velo.mean(axis=1),
                  'per_effort' : effort_velo.mean(axis=1),
                  'per_scale'  : scale_velo.mean(axis=1),
-                 'per_fit_std': fitness.std(axis=1),
                  'S'          : S}
 
     if log_per_tick:
         # trim to actual ticks executed (in case loop exited early via all-crashed break)
-        stats_out['tick_fit']    = tick_fit   [:, :, :total_ticks]
-        stats_out['tick_track']  = tick_track [:, :, :total_ticks]
-        stats_out['tick_effort'] = tick_effort[:, :, :total_ticks]
-        stats_out['tick_scale']  = tick_scale [:, :, :total_ticks]
-        stats_out['dt']          = dt
+        stats_out['tick_fit']        = tick_fit        [:, :, :total_ticks]
+        stats_out['tick_track']           = tick_track          [:, :, :total_ticks]
+        stats_out['tick_effort']          = tick_effort         [:, :, :total_ticks]
+        stats_out['tick_scale']           = tick_scale          [:, :, :total_ticks]
+        stats_out['tick_track_raw']       = tick_track_raw      [:, :, :total_ticks]
+        stats_out['tick_effort_raw']      = tick_effort_raw     [:, :, :total_ticks]
+        stats_out['tick_effort_weighted'] = tick_effort_weighted[:, :, :total_ticks]
+        stats_out['dt']                   = dt
 
     return individuals, stats_out
 
@@ -561,7 +616,8 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     scored = []
     stats  = {'fit_max': -np.inf, 'fit_mean': 0.0, 'fit_velo': 0.0,
               'fit_track': 0.0, 'fit_effort': 0.0, 'fit_scale': 0.0}
-    per_fit_all, per_track_all, per_effort_all, per_scale_all = [], [], [], []
+    per_fit_all, per_fit_raw_all = [], []
+    per_track_all, per_effort_all, per_scale_all = [], [], []
     per_fit_std_all = []
     S_val = None
     for indvs, stat in chunk_results:
@@ -569,21 +625,23 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
         stats['fit_mean']   += stat['fit_mean']
         stats['fit_velo']   += stat['fit_velo']
         stats['fit_max' ] =  max(stats['fit_max' ], stat['fit_max' ])
-        per_fit_all   .append(stat['per_fit'])
-        per_track_all .append(stat['per_track'])
-        per_effort_all.append(stat['per_effort'])
-        per_scale_all .append(stat['per_scale'])
+        per_fit_all    .append(stat['per_fit'])
+        per_fit_raw_all.append(stat['per_fit_raw'])
+        per_track_all  .append(stat['per_track'])
+        per_effort_all .append(stat['per_effort'])
+        per_scale_all  .append(stat['per_scale'])
         per_fit_std_all.append(stat['per_fit_std'])
         S_val = stat['S']
 
     stats['fit_mean']   /= cpus
     stats['fit_velo']   /= cpus
 
-    # global top 10 by per-drone fitness; report their raw component means
-    per_fit    = np.concatenate(per_fit_all)
-    per_track  = np.concatenate(per_track_all)
-    per_effort = np.concatenate(per_effort_all)
-    per_scale  = np.concatenate(per_scale_all)
+    # global top 10 by per-drone SE-fitness (matches selection); report their raw component means
+    per_fit     = np.concatenate(per_fit_all)        # SE form
+    per_fit_raw = np.concatenate(per_fit_raw_all)    # raw mean
+    per_track   = np.concatenate(per_track_all)
+    per_effort  = np.concatenate(per_effort_all)
+    per_scale   = np.concatenate(per_scale_all)
     k = min(10, per_fit.size)
     top10 = np.argpartition(per_fit, -k)[-k:]
     stats['fit_track']  = float(per_track [top10].mean())
@@ -592,10 +650,12 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
 
     print(f"track, {stats['fit_track']:.2f}, effort, {stats['fit_effort']:.2f}, scale, {stats['fit_scale']:.2f}")
 
+    # SEM diagnostic is on RAW values so the noise ratio is comparable across versions
+    # (sem comes from the raw per-drone std; pop_mean/cross_std use raw per-drone means).
     per_fit_std = np.concatenate(per_fit_std_all)
     sem        = (per_fit_std / np.sqrt(S_val)).mean()       # mean across drones of per-drone SEM
-    pop_mean   = per_fit.mean()                              # mean fitness across drones (of seed-mean)
-    cross_std  = per_fit.std()                               # std across drones (of seed-mean)
+    pop_mean   = per_fit_raw.mean()                          # raw mean fitness across drones
+    cross_std  = per_fit_raw.std()                           # raw std across drones (of seed-mean)
     ratio_mean = sem / pop_mean if pop_mean != 0 else float('inf')
     ratio_std  = sem / cross_std if cross_std != 0 else float('inf')
     print(f"SEM/pop_mean, {ratio_mean:.3f}, SEM/cross_std, {ratio_std:.3f}, S, {S_val}")
