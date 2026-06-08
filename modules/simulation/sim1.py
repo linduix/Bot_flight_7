@@ -202,6 +202,7 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     N = len(individuals) # drones
     S = 32                # trials per drone
     dt = .016
+    weight_penalty_coef = 1e-5   # tiny L2 penalty on genome weights, nudges toward simpler controllers
 
     # per-tick logging buffers (diagnostic only). when enabled, each tick's
     # raw increments (dt * track, dt * effort, dt * prox*pretouch, dt * score)
@@ -556,12 +557,18 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     per_seed_std  = fitness.std (axis=1)                 # raw per-drone std  (N,)
     per_drone_fit = per_seed_mean - per_seed_std / np.sqrt(S)
 
+    # tiny parsimony pressure: penalize mean-squared genome weight magnitude so that,
+    # all else equal, smaller/simpler weight vectors win out (smoother, less overfit
+    # controllers). mean (not sum) keeps this independent of genome size; coefficient
+    # is small enough to act only as a tie-breaker, not to outweigh the fitness signal.
+    weight_l2 = np.array([np.mean(ind.weights**2) for ind in individuals])
+    per_drone_fit = per_drone_fit - weight_penalty_coef * weight_l2
+
     top_idx = per_drone_fit.argsort()[-5:]
     top = fitness[top_idx, :]
 
     # print(f'in drone std {top.std(axis=1).mean(): .2f}, total std {top.std(): .2f}, cross drone std {top.mean(axis=1).std(): .2f}, arm {individuals[top_idx[-1]].tag}')
 
-    # TODO: add small parsimony pressure to have nn weights drift to smaller n more efficient weights for generalization
     for i, ind in enumerate(individuals):
         ind.fitness = float(per_drone_fit[i])
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
