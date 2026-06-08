@@ -561,6 +561,7 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
 
     # print(f'in drone std {top.std(axis=1).mean(): .2f}, total std {top.std(): .2f}, cross drone std {top.mean(axis=1).std(): .2f}, arm {individuals[top_idx[-1]].tag}')
 
+    # TODO: add small parsimony pressure to have nn weights drift to smaller n more efficient weights for generalization
     for i, ind in enumerate(individuals):
         ind.fitness = float(per_drone_fit[i])
         ind.descriptors = {'mean_gimb': mean_gimb[i], 'var_action': var_acti[i]}
