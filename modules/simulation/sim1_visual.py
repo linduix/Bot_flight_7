@@ -33,6 +33,11 @@ FOLLOW_DRONE = True
 # ideal_dv, actual_dv) + their text labels. toggled with A inside the visual.
 SHOW_ARROWS = True
 
+# ghost overlay: True = draw non-highlighted drones (dots + faint sprites) and the
+# yellow highlight ring. False = show only the highlighted drone (no ring, no ghosts).
+# toggled with G inside the visual.
+SHOW_GHOSTS = True
+
 
 def world_to_screen(pos_complex: complex) -> tuple[int, int]:
     rel = pos_complex - CAMERA
@@ -308,6 +313,9 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
             if event.type == pg.KEYDOWN and event.key == pg.K_a:
                 global SHOW_ARROWS
                 SHOW_ARROWS = not SHOW_ARROWS
+            if event.type == pg.KEYDOWN and event.key == pg.K_g:
+                global SHOW_GHOSTS
+                SHOW_GHOSTS = not SHOW_GHOSTS
         if quit_early:
             break
 
@@ -518,23 +526,27 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
                 pg.draw.lines(chain_layer, chain_color, False, pts, 1)
         screen.blit(chain_layer, (0, 0))
 
-        # non-featured: simple dots (trial 0 positions only)
-        dot_layer = pg.Surface((SCREEN_W, SCREEN_H), pg.SRCALPHA)
-        for i in range(N):
-            if i in featured:
-                continue
-            sx, sy = world_to_screen(state_t0[i, 0])
-            pg.draw.circle(dot_layer, (180, 180, 180, 70), (sx, sy), 3)
-        screen.blit(dot_layer, (0, 0))
+        # non-featured: simple dots (trial 0 positions only). gated by SHOW_GHOSTS (G).
+        if SHOW_GHOSTS:
+            dot_layer = pg.Surface((SCREEN_W, SCREEN_H), pg.SRCALPHA)
+            for i in range(N):
+                if i in featured:
+                    continue
+                sx, sy = world_to_screen(state_t0[i, 0])
+                pg.draw.circle(dot_layer, (180, 180, 180, 70), (sx, sy), 3)
+            screen.blit(dot_layer, (0, 0))
 
-        # featured (incl. highlight): low-alpha full sprites — trial 0 only
-        for i in featured:
-            if i == highlight:
-                continue
-            draw_drone(screen, state_t0[i], drone_surf, thruster_surf, drone_conf, alpha=140)
+        # featured (incl. highlight): low-alpha full sprites — trial 0 only.
+        # gated by SHOW_GHOSTS (G) along with the dots above and the yellow ring below.
+        if SHOW_GHOSTS:
+            for i in featured:
+                if i == highlight:
+                    continue
+                draw_drone(screen, state_t0[i], drone_surf, thruster_surf, drone_conf, alpha=140)
         if highlight is not None:
-            hx, hy = world_to_screen(state_t0[highlight, 0])
-            pg.draw.circle(screen, (255, 220, 60), (hx, hy), 18, 2)
+            if SHOW_GHOSTS:
+                hx, hy = world_to_screen(state_t0[highlight, 0])
+                pg.draw.circle(screen, (255, 220, 60), (hx, hy), 18, 2)
             draw_drone(screen, state_t0[highlight], drone_surf, thruster_surf, drone_conf, alpha=255)
             tx, ty = world_to_screen(target_t0[highlight])
             pg.draw.circle(screen, (100, 230, 100), (tx, ty), 3)
@@ -569,7 +581,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         seed_label = ("random",  "T: replay current") if RANDOM_SEED_MODE else ("current", "T: randomize")
         cam_label  = ("drone",   "F: follow target")  if FOLLOW_DRONE    else ("target",  "F: follow drone")
         arrow_label= ("on",      "A: hide arrows")    if SHOW_ARROWS     else ("off",     "A: show arrows")
-        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}  seed: {seed_label[0]} [{seed_label[1]}]  cam: {cam_label[0]} [{cam_label[1]}]  arrows: {arrow_label[0]} [{arrow_label[1]}]", True, (150, 150, 150)), (10, 10))
+        ghost_label= ("on",      "G: hide ghosts")    if SHOW_GHOSTS     else ("off",     "G: show ghosts")
+        screen.blit(font.render(f"FPS: {fps:.0f}  Drones: {N}  t={sim_time:.1f}/{settings['limit']:.1f}  seed: {seed_label[0]} [{seed_label[1]}]  cam: {cam_label[0]} [{cam_label[1]}]  arrows: {arrow_label[0]} [{arrow_label[1]}]  ghosts: {ghost_label[0]} [{ghost_label[1]}]", True, (150, 150, 150)), (10, 10))
         # highlighted drone's running fitness components (mean over seeds, raw quality)
         hi_track  = float(track_velo [highlight].mean())
         hi_effort = float(effort_velo[highlight].mean())

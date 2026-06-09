@@ -14,14 +14,14 @@ class MAB():
             self.arms[k] = {'pulls': 0.0, 'score': 0.0, 'value': np.inf}
 
     def update_stats(self, scores: dict[str, float]):
-        # update the new scores
+        # EMA each arm's reward: 95% old, 5% new
         for arm, score in scores.items():
-            self.arms[arm]['score'] += score
+            s = self.arms[arm]
+            s['score'] = 0.95 * s['score'] + 0.05 * score
 
-        # decay the old values
+        # decay pull counts (drives the exploration term)
         for stats in self.arms.values():
             stats['pulls'] *= self.decay
-            stats['score'] *= self.decay
         self.total_pulls *= self.decay
 
     def recompute_values(self):
@@ -30,12 +30,9 @@ class MAB():
             if stats['pulls'] == 0:
                 continue
 
-            # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
-            mean_score  = stats['score'] / stats['pulls']
+            # arm_value = EMA reward + sqrt( 2 * ln(total pulls) / arm pulls )
             exploration = np.sqrt(0.1 * np.log(self.total_pulls) / stats['pulls'])
-            arm_value   = mean_score + exploration
-
-            stats['value'] = arm_value
+            stats['value'] = stats['score'] + exploration
 
     def pull(self, qty: int) -> list[str]: # dict[str, int]:
         budget = {k: 0 for k in self.arms}

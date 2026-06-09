@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 import os
 
 
+# 40 equal bins over [0,1], final [0.975,1.0] bar split at 0.99 so the
+# saturation spike (signal >= 0.99) lands in its own bin. x-range stays [0,1].
+HIST_BINS = np.sort(np.append(np.linspace(0, 1, 41), 0.99))
+
 save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
 
 
@@ -190,7 +194,7 @@ if __name__ == "__main__":
         a.legend(loc='lower right', fontsize=8)
 
         a = ax[0, 1]
-        bins = np.linspace(0, 1, 41)
+        bins = HIST_BINS
         a.hist(best_sig,  bins=bins, color=color_best,  alpha=0.5,
                label=f'best  μ={best_sig.mean():.3f}  σ={best_sig.std():.3f}')
         a.hist(worst_sig, bins=bins, color=color_worst, alpha=0.5,
@@ -344,7 +348,7 @@ if __name__ == "__main__":
             a = axes3[i, j]
             if i == j:
                 # DIAGONAL: histogram
-                a.hist(sig_i, bins=40, color=color_i, alpha=0.7)
+                a.hist(sig_i, bins=HIST_BINS, color=color_i, alpha=0.7)
                 a.set_xlim(-0.05, 1.05)
                 a.set_yticks([])
             elif i > j:

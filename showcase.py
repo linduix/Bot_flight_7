@@ -93,6 +93,7 @@ def showcase(individuals, sector_coords, present, dt=1/60):
 
     drone_conf = get_drone_conf(config_path)
     max_a = 2 * drone_conf['th_force'] / drone_conf['M']   # control authority for zem_a/zev_a cap
+    hover = drone_conf['M'] * abs(drone_conf['G']) / (2 * drone_conf['th_force'])  # throttle pre-spool (matches sim1)
     Brain = brain(individuals)
     N = len(individuals)
     S = 1  # one trial per drone in showcase mode
@@ -104,7 +105,8 @@ def showcase(individuals, sector_coords, present, dt=1/60):
     highlight = 0
 
     # init state matrix (N, 6, S)
-    state_matrix  = np.zeros((N, 6, S), dtype=complex)
+    state_matrix  = np.zeros((N, 7, S), dtype=complex)
+    state_matrix[:, 6, :] = hover + 1j * hover   # pre-spool throttle to hover (matches sim1)
     action_matrix = np.zeros((N, 4, S), dtype=float)
     prev_los      = None
     prev_target   = None
@@ -143,6 +145,7 @@ def showcase(individuals, sector_coords, present, dt=1/60):
             for i in np.where(far)[0]:
                 state_matrix[i, :, :] = 0
                 state_matrix[i, 2, :] = np.random.uniform(-np.deg2rad(15), np.deg2rad(15))
+                state_matrix[i, 6, :] = hover + 1j * hover   # re-spool throttle to hover
 
         # observations (27-input, mirrors sim1.py)
         eps   = 1e-8
@@ -202,8 +205,9 @@ def showcase(individuals, sector_coords, present, dt=1/60):
         ang_vel   = state_matrix[:, 3, :].real
         t1_ang    = state_matrix[:, 4, :].real
         t2_ang    = state_matrix[:, 5, :].real
-        t1_thrust = action_matrix[:, 0, :]
-        t2_thrust = action_matrix[:, 1, :]
+        # actual integrated throttle level (slot 6), not the command — mirrors sim1
+        t1_thrust = state_matrix[:, 6, :].real
+        t2_thrust = state_matrix[:, 6, :].imag
 
         obs = np.stack([
             dist / 10.0, los_local.real, los_local.imag, los_rate, tti_obs,
