@@ -131,6 +131,8 @@ class cma_fit():
     restart_reason = 'init'
     lag_count = 0
     tag = 'cma_fit'
+    kill = False
+    stateful = True
 
     def __init__(self, step_norm=0.4) -> None:
         # target aggregate displacement of a sample from the seed; per-dim sigma
@@ -185,6 +187,7 @@ class cma_fit():
             self.cma.tell([(g, -f) for g, f in batch])
 
         if self.cma.should_stop():
+            self.kill = True
             self.restart = True
             self.restart_reason = 'should_stop'
 
@@ -238,3 +241,12 @@ class cma_improv(cma_fit):
         for i in individuals:
             g = np.concatenate([i.weights, i.biases])
             self.buffer.append((g, i.improv))
+
+class stateless_wrapper(object):
+    def __init__(self, func) -> None:
+        self.func = func
+        self.stateful = False
+        pass
+
+    def ask(self, archive, qty):
+        return self.func(archive, qty)

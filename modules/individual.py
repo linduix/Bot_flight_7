@@ -11,3 +11,4 @@ class Individual:
     descriptors: dict       = field(default_factory=dict)
     stats:       list|None  = None
     improv:      float|None = None
+    instance                = None

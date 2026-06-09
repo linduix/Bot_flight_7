@@ -1,3 +1,5 @@
+from matplotlib.pyplot import phase_spectrum
+
 from modules.individual import Individual
 from modules.evo_alg import arms
 from typing import Callable, cast
@@ -32,13 +34,14 @@ class MAB():
 
             # arm_value = mean score + sqrt( 2 * ln(total pulls) / arm pulls )
             mean_score  = stats['score'] / stats['pulls']
-            exploration = np.sqrt(0.05 * np.log(self.total_pulls) / stats['pulls'])
+            exploration = np.sqrt(0.1 * np.log(self.total_pulls) / stats['pulls'])
             arm_value   = mean_score + exploration
 
             stats['value'] = arm_value
 
-    def pull(self, qty: int) -> dict[str, int]:
+    def pull(self, qty: int) -> list[str]: # dict[str, int]:
         budget = {k: 0 for k in self.arms}
+        pulls = []
 
         for _ in range(qty):
             self.recompute_values()
@@ -47,10 +50,11 @@ class MAB():
 
             # increment the budget + pulls
             budget[best]     += 1
+            pulls.append(best)
             self.total_pulls += 1
             self.arms[best]['pulls'] += 1
 
-        return budget
+        return pulls
 
 class Archive():
     def __init__(self, res) -> None:
@@ -124,6 +128,19 @@ class algorithm():
         self.cma_fit = arms.cma_fit()
         self.cma_improv = arms.cma_improv()
 
+        # Bench rotation bandit design
+        self.max_active = 15
+        self.emitter_batch_size = 50
+        self.active: list[object] = []
+        self.stateful = {'cma_improv', 'cma_fit'}
+        self.bench =  {
+            'cma_improv': arms.cma_improv,
+            'cma_fit' : arms.cma_fit,
+            'random'  : arms.random,
+            'gaussian': arms.gaussian,
+            'iso'     : arms.iso,
+        }
+
         self.arms: dict['str', Callable[[Archive, int], list[Individual]]] = {
             'random'  : arms.random,
             'gaussian': arms.gaussian,
@@ -141,20 +158,37 @@ class algorithm():
             return proposition, {'budget': {'random': qty}}
 
         # get the arm budget
-        budget = self.bandit.pull(qty)
+        qty_short = self.max_active - len(self.active)
+        pulls = self.bandit.pull(qty_short)
         proposition: list[Individual] = []
 
         # for each arm add its budgeted propositions
-        for arm, budg in budget.items():
-            indvs = self.arms[arm](self.archive, budg)
+        # for arm, budg in budget.items():
+        #     indvs = self.arms[arm](self.archive, budg)
+        #     proposition.extend(indvs)
+
+        # create an instance of each emitter till active is full
+        while len(self.active) < self.max_active:
+            for pull in pulls:
+                if pull in self.stateful:
+                    instance = self.bench[pull]
+                else:
+                    instance = arms.stateless_wrapper(self.bench[pull])
+                self.active.append(instance)
+
+        for i, instance in enumerate(self.active):
+            indvs = instance.ask(self.archive, self.emitter_batch_size)
+            for ind in indvs:
+                ind.instance = i
             proposition.extend(indvs)
 
-        return proposition, {'budget': dict(budget)}
+        return proposition, {'budget': 'temp empty'}
 
 
     def update(self, individuals: list[Individual]):
         bandit_score = {k: 0.0 for k in self.arms.keys()}
         self.archive.curi_decay = 0.1 ** (8/self.batch_size) # curiosity decay factor
+        instance_indvs = {i: [] for i, instance in enumerate(self.active) if instance.stateful}
 
         stats = {'discoveries': 0, 'updates': 0, 'bandit_score': bandit_score}
         max_contrib = 0.0  # biggest single-individual contribution this batch
@@ -181,12 +215,20 @@ class algorithm():
                         contrib = (i.fitness - old_fit)**2        # type:ignore
                     else:
                         contrib = i.fitness**2 - old_fit**2       # type:ignore
-                    bandit_score[i.tag] += contrib
+                    bandit_score[i.tag] += 1/self.emitter_batch_size
                     max_contrib = max(max_contrib, contrib)
 
+            # give feedback to any stateful instances
+            if i.tag in self.stateful:
+                assert isinstance(i.instance, int)
+                instance_indvs[i.instance].append(i)
+
+
         # update cma
-        self.cma_fit.tell(individuals, self.archive)
-        self.cma_improv.tell(individuals, self.archive)
+        # self.cma_fit.tell(individuals, self.archive)
+        # self.cma_improv.tell(individuals, self.archive)
+        for i, indvs in instance_indvs.items():
+            self.active[i].tell(indvs)
 
         # normalize each individual's reward to [0, 1] by the batch's single
         # best contribution, NOT by the arm totals. dividing by max_contrib (one
@@ -194,9 +236,9 @@ class algorithm():
         # MAB's later score/pulls lands in [0, 1] instead of being squashed by
         # the batch budget. the unchanged fitness**2 formula still makes
         # high-fitness refinement worth more, and volume is preserved.
-        if max_contrib > 0:
-            for k in bandit_score:
-                bandit_score[k] /= max_contrib
+        # if max_contrib > 0:
+        #     for k in bandit_score:
+        #         bandit_score[k] /= max_contrib
 
         # update the bandit
         if self.gen > 0:
