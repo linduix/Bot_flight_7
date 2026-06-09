@@ -231,7 +231,6 @@ class cma_fit():
         r, c = occupied[np.random.randint(len(occupied))]
         chosen: Individual = archive.indv[r, c] # type: ignore
 
-        print(f"[cma reset] reason={self.restart_reason} elite=({r},{c}) fit={chosen.fitness:.3f}", flush=True)
         return chosen
 
 class cma_improv(cma_fit):

@@ -222,11 +222,31 @@ class algorithm():
         for i, indvs in instance_indvs.items():
             self.active[i].tell(indvs, self.archive)
 
-        # terminate stateful instances that converged (should_stop) or contributed
-        # nothing to the archive this gen; their slot returns to the bandit next
-        # propose (ME-MAP-Elites: restart when archive unchanged after a batch).
-        self.active = [inst for idx, inst in enumerate(self.active)
-                       if inst.stateful and not inst.kill and instance_updates[idx] > 0]
+        # kill stateful emitters that either converged (should_stop) or have gone
+        # >= 10 consecutive gens without a single archive update
+        killed_counts: dict[str, int] = {}
+        next_active: list = []
+        for idx, inst in enumerate(self.active):
+            if not inst.stateful:
+                continue
+            if inst.kill:
+                killed_counts[inst.tag] = killed_counts.get(inst.tag, 0) + 1
+                continue
+            if instance_updates.get(idx, 0) > 0:
+                inst.stagnation_count = 0
+                next_active.append(inst)
+            else:
+                inst.stagnation_count = getattr(inst, 'stagnation_count', 0) + 1
+                if inst.stagnation_count >= 10:
+                    killed_counts[inst.tag] = killed_counts.get(inst.tag, 0) + 1
+                else:
+                    next_active.append(inst)
+
+        if killed_counts:
+            parts = ' '.join(f'{tag} {n}x' for tag, n in sorted(killed_counts.items()))
+            print(f'[emitter kill] killed: {parts}', flush=True)
+
+        self.active = next_active
 
         # normalize each individual's reward to [0, 1] by the batch's single
         # best contribution, NOT by the arm totals. dividing by max_contrib (one
