@@ -1,4 +1,4 @@
-from modules.evo_alg.mapElites import load
+from modules.evo_alg.mapElites import load_alg
 from modules.simulation.sim1 import sim
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,7 +33,7 @@ def pick_quartile_elites(archive, per_quartile: int = 5):
 
 
 if __name__ == "__main__":
-    alg, settings, seed = load(save_path)
+    alg, settings, seed = load_alg(save_path)
     print(f"loaded checkpoint (gen {alg.gen}) — settings={settings} seed={seed}")
 
     elites = pick_quartile_elites(alg.archive, per_quartile=5)

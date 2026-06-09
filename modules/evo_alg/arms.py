@@ -154,7 +154,7 @@ class cma_fit():
 
     def ask(self, archive: Archive, qty) -> list[Individual]:
         if self.restart:
-            self._reset(archive)
+            self._reset(archive, qty)
             self.restart = False
 
         children = []
@@ -210,13 +210,16 @@ class cma_fit():
                     self.restart_reason = 'stale_seed'
                     self.lag_count = 0
 
-    def _reset(self, archive: Archive):
+    def _reset(self, archive: Archive, pop_size):
         chosen: Individual = self._select_seed(archive)
 
-        # create new cma instance; scale per-dim sigma to genome dimension
+        # create new cma instance; scale per-dim sigma to genome dimension.
+        # fix CMA population to the emitter batch size so every ask() produces
+        # exactly one CMA generation and every batch's feedback fills exactly one
+        # tell -- no buffering across gens.
         base = np.concat([chosen.weights, chosen.biases])
         self.sigma  = self.step_norm / np.sqrt(len(base))
-        self.cma    = SepCMA(mean=base, sigma=self.sigma)
+        self.cma    = SepCMA(mean=base, sigma=self.sigma, population_size=pop_size)
         self.buffer = []
         self.pop    = self.cma.population_size
         self.n_weights = len(chosen.weights)
@@ -246,7 +249,7 @@ class stateless_wrapper(object):
     def __init__(self, func) -> None:
         self.func = func
         self.stateful = False
-        pass
+        self.tag = func.__name__
 
     def ask(self, archive, qty):
         return self.func(archive, qty)

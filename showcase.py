@@ -11,7 +11,7 @@ from modules.simulation.sim1_visual import (
     draw_drone, spawn_thruster_particles, world_to_screen,
     METERS_TO_PIXELS, SCREEN_W, SCREEN_H,
 )
-from modules.evo_alg.mapElites import load
+from modules.evo_alg.mapElites import load_alg
 
 
 def screen_to_world(mx: int, my: int) -> complex:
@@ -263,7 +263,7 @@ def showcase(individuals, sector_coords, present, dt=1/60):
 
 if __name__ == "__main__":
     save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
-    alg, settings, _ = load(save_path)
+    alg, settings, _ = load_alg(save_path)
 
     featured, sector_coords, present = pick_featured(alg.archive.indv)
     if not featured:

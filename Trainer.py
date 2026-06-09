@@ -51,8 +51,11 @@ MAX_LENGTH = 75
 if __name__=='__main__':
     # load save
     if os.path.isfile(save_path):
-        alg, settings, seed = load(save_path)
+        archive, gen, settings, seed = load(save_path)
+        alg = algorithm(resolution=RESOLUTION)
+        alg.archive = archive
         alg.archive.res = RESOLUTION
+        alg.gen = gen
 
     else:
         alg = algorithm(resolution=RESOLUTION)
@@ -108,17 +111,10 @@ if __name__=='__main__':
                 print(f"\n=== gen {alg.gen} [{elapsed:.2f}s] ===")
                 print(f"  timing:     prop {t_prop:>5.2f}s | sim {t_sim:>5.2f}s | upd {t_upd:>5.2f}s")
 
-                # propose: per-arm budget allocation + bandit performance relative to best arm
-                budget = propose_stats['budget']
-                budget_str = ' | '.join(f"{k} {v:>4d}" for k, v in budget.items())
-                print(f"  propose:    {budget_str}")
-                gen_means = {arm: float(np.mean(f)) if (f := [i.fitness for i in scores if i.tag == arm]) else 0.0 for arm in alg.bandit.arms}
-                means = {arm: (s['score']/s['pulls'] if s['pulls'] > 0 else 0.0) for arm, s in alg.bandit.arms.items()}
-                top_b = max(budget.values()) if budget else 0
-                print(f"              {'arm':<10} {'mean':>7} {'gen_fit':>8} {'ratio':>7}")
-                for arm, m in means.items():
-                    ratio = budget.get(arm, 0)/top_b if top_b > 0 else 0.0
-                    print(f"              {arm:<10} {m:>7.3f} {gen_means[arm]:>8.3f} {ratio:>6.2f}x")
+                # propose: active emitter counts
+                ps = propose_stats
+                active_str = f"active {ps['active']}  " + '  '.join(f"{k} {v}" for k, v in ps.items() if k != 'active')
+                print(f"  propose:    {active_str}")
 
                 # sim: per-batch fitness
                 print(f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}")

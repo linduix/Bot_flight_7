@@ -612,10 +612,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
 
 if __name__ == "__main__":
     import os
-    from modules.evo_alg.mapElites import load
+    from modules.evo_alg.mapElites import load_alg
 
     save_path = os.path.join('data', 'MAP_Checkpoint.pkl')
-    alg, settings, seed = load(save_path)
+    alg, settings, seed = load_alg(save_path)
 
     # 3x3 coarse bin → best elite per bin (featured, full sprite),
     # everything else → ghost line art.

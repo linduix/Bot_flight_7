@@ -1,8 +1,6 @@
-from matplotlib.pyplot import phase_spectrum
-
 from modules.individual import Individual
 from modules.evo_alg import arms
-from typing import Callable, cast
+from typing import cast
 import pickle as pkl
 import numpy as np
 import os
@@ -125,56 +123,47 @@ class algorithm():
     def __init__(self, resolution) -> None:
         self.gen = 0
         self.archive = Archive(resolution)
-        self.cma_fit = arms.cma_fit()
-        self.cma_improv = arms.cma_improv()
 
         # Bench rotation bandit design
-        self.max_active = 15
         self.emitter_batch_size = 50
+        self.max_active = 0  # derived from population in propose()
         self.active: list[object] = []
         self.stateful = {'cma_improv', 'cma_fit'}
-        self.bench =  {
+        self.bench = {
             'cma_improv': arms.cma_improv,
-            'cma_fit' : arms.cma_fit,
-            'random'  : arms.random,
-            'gaussian': arms.gaussian,
-            'iso'     : arms.iso,
+            'cma_fit'   : arms.cma_fit,
+            'random'    : arms.random,
+            'gaussian'  : arms.gaussian,
+            'iso'       : arms.iso,
         }
 
-        self.arms: dict['str', Callable[[Archive, int], list[Individual]]] = {
-            'random'  : arms.random,
-            'gaussian': arms.gaussian,
-            'iso'     : arms.iso,
-            'cma_fit' : self.cma_fit.ask,
-            'cma_improv' : self.cma_improv.ask
-        }
-        self.bandit = MAB(list(self.arms.keys()))
+        self.bandit = MAB(list(self.bench.keys()))
 
     def propose(self, qty, Mpool=None) -> tuple[ list[Individual], dict ]:
         # initial bootsrap
         self.batch_size = qty
         if self.gen == 0:
             proposition: list[Individual] = arms.random(self.archive, qty)
-            return proposition, {'budget': {'random': qty}}
+            return proposition, {'active': 1, 'random': 1}
 
-        # get the arm budget
+        # cap active emitters so total proposals (max_active * emitter_batch_size)
+        # stay within the population budget
+        self.max_active = qty // self.emitter_batch_size
+
+        # evict dead stateful emitters, freeing slots for the bandit to refill
+        self.active = [inst for inst in self.active if not getattr(inst, 'kill', False)]
+
+        # spawn new emitters to fill vacant slots
         qty_short = self.max_active - len(self.active)
         pulls = self.bandit.pull(qty_short)
         proposition: list[Individual] = []
 
-        # for each arm add its budgeted propositions
-        # for arm, budg in budget.items():
-        #     indvs = self.arms[arm](self.archive, budg)
-        #     proposition.extend(indvs)
-
-        # create an instance of each emitter till active is full
-        while len(self.active) < self.max_active:
-            for pull in pulls:
-                if pull in self.stateful:
-                    instance = self.bench[pull]
-                else:
-                    instance = arms.stateless_wrapper(self.bench[pull])
-                self.active.append(instance)
+        for pull in pulls:
+            if pull in self.stateful:
+                instance = self.bench[pull]()
+            else:
+                instance = arms.stateless_wrapper(self.bench[pull])
+            self.active.append(instance)
 
         for i, instance in enumerate(self.active):
             indvs = instance.ask(self.archive, self.emitter_batch_size)
@@ -182,13 +171,17 @@ class algorithm():
                 ind.instance = i
             proposition.extend(indvs)
 
-        return proposition, {'budget': 'temp empty'}
+        counts: dict[str, int] = {}
+        for inst in self.active:
+            counts[inst.tag] = counts.get(inst.tag, 0) + 1
+        return proposition, {'active': len(self.active), **counts}
 
 
     def update(self, individuals: list[Individual]):
-        bandit_score = {k: 0.0 for k in self.arms.keys()}
+        bandit_score = {k: 0.0 for k in self.bench.keys()}
         self.archive.curi_decay = 0.1 ** (8/self.batch_size) # curiosity decay factor
-        instance_indvs = {i: [] for i, instance in enumerate(self.active) if instance.stateful}
+        instance_indvs    = {i: [] for i, instance in enumerate(self.active) if instance.stateful}
+        instance_updates  = {i: 0  for i in instance_indvs}  # archive inserts per stateful instance this gen
 
         stats = {'discoveries': 0, 'updates': 0, 'bandit_score': bandit_score}
         max_contrib = 0.0  # biggest single-individual contribution this batch
@@ -222,13 +215,18 @@ class algorithm():
             if i.tag in self.stateful:
                 assert isinstance(i.instance, int)
                 instance_indvs[i.instance].append(i)
+                if delta > 0:
+                    instance_updates[i.instance] += 1
 
 
-        # update cma
-        # self.cma_fit.tell(individuals, self.archive)
-        # self.cma_improv.tell(individuals, self.archive)
         for i, indvs in instance_indvs.items():
-            self.active[i].tell(indvs)
+            self.active[i].tell(indvs, self.archive)
+
+        # terminate stateful instances that converged (should_stop) or contributed
+        # nothing to the archive this gen; their slot returns to the bandit next
+        # propose (ME-MAP-Elites: restart when archive unchanged after a batch).
+        self.active = [inst for idx, inst in enumerate(self.active)
+                       if inst.stateful and not inst.kill and instance_updates[idx] > 0]
 
         # normalize each individual's reward to [0, 1] by the batch's single
         # best contribution, NOT by the arm totals. dividing by max_contrib (one
@@ -261,7 +259,7 @@ class algorithm():
         resoulution  = self.archive.res
         self.archive = Archive(resoulution)
 
-        self.bandit      = MAB(list(self.arms.keys()))
+        self.bandit      = MAB(list(self.bench.keys()))
         # keep the CMA arms across curriculum transitions: their mean+covariance
         # live in genome space (network topology is unchanged between stages), so
         # the learned distribution is still valid progress. rebuilding them here
@@ -277,144 +275,27 @@ def save(path, alg, settings, seed):
         os.makedirs(d, exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'wb') as f:
-        pkl.dump({'alg': alg, 'settings': settings, 'seed': seed}, f)
+        pkl.dump({'archive': alg.archive, 'gen': alg.gen, 'settings': settings, 'seed': seed}, f)
     os.replace(tmp, path)
 
 def load(path) -> tuple:
     with open(path, 'rb') as f:
         data = pkl.load(f)
-    return data['alg'], data['settings'], data['seed']
+    # new checkpoints store only the archive + gen; old ones store the whole alg
+    archive = data['archive'] if 'archive' in data else data['alg'].archive
+    gen     = data['gen']     if 'gen'     in data else data['alg'].gen
+    return archive, gen, data['settings'], data['seed']
+
+def load_alg(path) -> tuple:
+    # reconstruct a fresh algorithm with the saved archive + gen restored, at the
+    # archive's own resolution. for viz/diagnostic scripts that just want the
+    # checkpoint's state without forcing a resolution.
+    archive, gen, settings, seed = load(path)
+    alg = algorithm(archive.res)
+    alg.archive = archive
+    alg.gen = gen
+    return alg, settings, seed
 
 import signal as _signal
 def _worker_init():
     _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
-
-if __name__ == "__main__":
-    import time
-    from multiprocessing.pool import Pool
-    from modules.simulation import sim1
-
-    N_SEEDS     = 1
-    MAX_SECONDS = 60 * 5
-    BATCH_SIZE  = 4000
-    RESOLUTION  = 25
-
-    results = []
-    with Pool(initializer=_worker_init) as Mpool:
-        for k in range(N_SEEDS):
-            print(f"\n=== seed {k+1}/{N_SEEDS} ===", flush=True)
-            alg = algorithm(RESOLUTION)
-
-            start = time.time()
-            gen_count = 0
-            trajectory = []
-            total_evals = 0
-            while time.time() - start < MAX_SECONDS:
-                indv, propstat = alg.propose(BATCH_SIZE)
-                indv, simstat  = sim1.parallel_sim(indv, {'limit': 10, 'length': 10}, Mpool)
-                updatestat     = alg.update(indv)
-                elapsed = time.time() - start
-                total_evals += BATCH_SIZE
-
-                occ = alg.archive.fit[alg.archive.fit > -np.inf]
-                top10 = np.sort(occ)[-10:].mean() if len(occ) >= 10 else occ.mean()
-                trajectory.append((elapsed, updatestat['archive_best'], top10))
-                gen_count += 1
-
-            times  = np.array([t[0] for t in trajectory])
-            bests  = np.array([t[1] for t in trajectory])
-            top10s = np.array([t[2] for t in trajectory])
-
-            auc_best  = float(np.trapezoid(bests,  times) / times[-1])
-            auc_top10 = float(np.trapezoid(top10s, times) / times[-1])
-
-            time_to = {}
-            for thr in [2.0, 3.0, 4.0, 5.0]:
-                idx = np.argmax(bests >= thr)
-                time_to[thr] = float(times[idx]) if bests[idx] >= thr else None
-
-            total_pulls = sum(s['pulls'] for s in alg.bandit.arms.values())
-            total_score = sum(s['score'] for s in alg.bandit.arms.values())
-            arm_stats = {}
-            for arm, s in alg.bandit.arms.items():
-                arm_stats[arm] = {
-                    'mean':  s['score']/s['pulls'] if s['pulls'] > 0 else 0.0,
-                    'pull%': s['pulls']/total_pulls if total_pulls > 0 else 0.0,
-                    'score%':s['score']/total_score if total_score > 0 else 0.0,
-                }
-
-            coverage = float((alg.archive.fit > -np.inf).sum()) / (alg.archive.res ** 2)
-
-            results.append({
-                'gens':        gen_count,
-                'final_top10': float(top10s[-1]),
-                'auc_best':    auc_best,
-                'auc_top10':   auc_top10,
-                'coverage':    coverage,
-                'time_to':     time_to,
-                'arms':        arm_stats,
-                'alg':         alg,
-            })
-            print(f"  top10={results[-1]['final_top10']:.3f}  AUC_top10={results[-1]['auc_top10']:.3f}  cov={coverage:.2f}  gens={gen_count}", flush=True)
-
-    # ---- summary stats across seeds ----
-    top10s = [r['final_top10'] for r in results]
-    aucs   = [r['auc_top10']   for r in results]
-    aucbs  = [r['auc_best']    for r in results]
-    covs   = [r['coverage']    for r in results]
-    gens   = [r['gens']        for r in results]
-
-    print(f"\n=== summary across {N_SEEDS} seeds ({MAX_SECONDS}s, batch={BATCH_SIZE}) ===")
-    print(f"  {'metric':<14} {'min':>7} {'median':>7} {'max':>7} {'mean':>7} {'std':>7}")
-    for name, vals in [('final_top10', top10s), ('AUC_top10', aucs), ('AUC_best', aucbs), ('coverage', covs), ('gens', gens)]:
-        a = np.array(vals, dtype=float)
-        print(f"  {name:<14} {a.min():>7.3f} {np.median(a):>7.3f} {a.max():>7.3f} {a.mean():>7.3f} {a.std():>7.3f}")
-
-    print(f"\n  threshold reach rate:")
-    for thr in [2.0, 3.0, 4.0, 5.0]:
-        hit_times = [r['time_to'][thr] for r in results if r['time_to'][thr] is not None]
-        rate = len(hit_times) / N_SEEDS
-        if hit_times:
-            print(f"    fit>={thr}: {rate:.0%}  (median time {np.median(hit_times):.1f}s)")
-        else:
-            print(f"    fit>={thr}: {rate:.0%}  (never reached)")
-
-    print(f"\n  arm allocation (mean across seeds):")
-    print(f"    {'arm':<10} {'pull%':>7} {'score%':>7} {'mean':>7}")
-    for arm in results[0]['arms']:
-        pull_pct  = np.mean([r['arms'][arm]['pull%']  for r in results])
-        score_pct = np.mean([r['arms'][arm]['score%'] for r in results])
-        mean_sc   = np.mean([r['arms'][arm]['mean']   for r in results])
-        print(f"    {arm:<10} {pull_pct:>6.1%} {score_pct:>6.1%} {mean_sc:>7.3f}")
-
-    # ---- heatmap from the final seed run ----
-    alg = results[-1]['alg']
-
-    import matplotlib.pyplot as plt
-    occ_mask = alg.archive.fit > -np.inf
-    extent   = [alg.archive.xrange[0], alg.archive.xrange[1],
-                alg.archive.yrange[0], alg.archive.yrange[1]]
-
-    fail_success = np.log10((alg.archive.failed + 1) / (alg.archive.successes + 1))
-
-    panels = [
-        ('fitness',       alg.archive.fit,  'viridis'),
-        ('log curiosity', alg.archive.curi, 'magma'),
-        ('improvement',   alg.archive.impr, 'plasma'),
-        ('fail/success',  fail_success,     'inferno'),
-    ]
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
-    axes = axes.flatten()
-    for ax, (label, data, cmap) in zip(axes, panels):
-        display = np.where(occ_mask, data, np.nan)
-        im = ax.imshow(display.T, origin='lower', aspect='auto', cmap=cmap, extent=extent) # type: ignore
-        ax.set_box_aspect(1)
-        plt.colorbar(im, ax=ax, label=label)
-        ax.set_xlabel('mean gimbal angle (rad)')
-        ax.set_ylabel('activation variance')
-        ax.set_title(f'{label} — gen {alg.gen} (final seed)')
-
-    plt.tight_layout()
-    plt.savefig('archive_heatmap.png', dpi=150)
-    plt.show()

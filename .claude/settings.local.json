@@ -9,7 +9,10 @@
       "Bash(python -m py_compile modules/simulation/sim1.py modules/evo_alg/arms.py modules/evo_alg/mapElites.py)",
       "Bash(python -m py_compile modules/simulation/sim1.py showcase.py)",
       "Bash(python -m py_compile modules/simulation/sim1.py)",
-      "Bash(python -m py_compile diagnostic.py)"
+      "Bash(python -m py_compile diagnostic.py)",
+      "Bash(git rm *)",
+      "Bash(python -c \"import inspect; from cmaes import SepCMA; print\\(inspect.signature\\(SepCMA.__init__\\)\\)\")",
+      "Bash(python -c 'import ast,sys *)"
     ]
   }
 }
