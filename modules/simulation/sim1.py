@@ -216,6 +216,11 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         tick_track_raw       = np.zeros((N, S, T_alloc), dtype=np.float32)  # pre-EMA
         tick_effort_raw      = np.zeros((N, S, T_alloc), dtype=np.float32)  # pre-criticality, pre-EMA
         tick_effort_weighted = np.zeros((N, S, T_alloc), dtype=np.float32)  # post-criticality, pre-EMA
+        tick_discount        = np.zeros((N, S, T_alloc), dtype=np.float32)  # time-pressure decay, gamma**ticks_since_touch
+        # drone position in the target's frame (drone - target, complex). |tick_rel|
+        # gives distance-to-target; the complex value itself is the target-centered
+        # trajectory. one buffer serves both the distance and trajectory diagnostics.
+        tick_rel             = np.zeros((N, S, T_alloc), dtype=np.complex64)
 
     # initialize targets
     rng = np.random.default_rng(seed)
@@ -267,6 +272,14 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     crashed = np.zeros((N, S), dtype=bool) # latched flag: drone has flown out of bounds; zeros all future fitness
     crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
 
+    # TIME PRESSURE: ticks since the drone was last INSIDE the target (resets to 0 on
+    # every touch, instantaneous — not the latched `toggle`). per-tick score is scaled
+    # by discount = touch_gamma ** ticks_since_touch, halving every 1/3 of the episode
+    # so lingering away from the target bleeds reward; sitting on it keeps discount = 1.
+    ticks_since_touch = np.zeros((N, S), dtype=np.int64)
+    halflife_ticks    = max(1.0, np.ceil(settings['limit'] / dt) / 3.0)
+    touch_gamma       = float(0.5 ** (1.0 / halflife_ticks))
+
     # fitness + descriptor arrays
     # descriptors: mean gimbal angle, activation variance
     fitness_velo  = np.zeros((N, S), dtype=np.float32)
@@ -284,6 +297,10 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     floor = 0.5    # hover tolerance for the tracking scale, m/s
     effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
 
+    # nested-headroom score knobs (both in [0,1]; keep <1 for the [0,1] bound + no-veto).
+    LAMBDA_BRIDGE = 1.0  # fraction of the (1-prox) distance headroom tracking may fill
+    MU_BRIDGE     = 0.2  # fraction of the (1-track) tracking headroom effort may fill
+
     # scale shape: f(x) = 1/(K·(x+A)) − A   where x = dist/L (normalized).
     # constants chosen so f(0)=1, f(1)=0, f(0.2)=0.2 — packs the dynamic range
     # into the hover regime (first 20% of L) so trained drones don't saturate at 1.
@@ -291,21 +308,15 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     SCALE_K = 225.0 / 16.0   # = 14.0625
     inv_L   = 1.0 / settings['length']
 
-    # criticality gate for the effort score. quadratic exponent so the gate is
-    # ~closed (criticality ≈ 0, effort LERP'd to 1) when err_mag is small (hover,
-    # scale near 1), and ~fully open (criticality ≈ 1, raw effort passes through)
-    # by err_mag = 6·max_a·dt (≈ 6 ticks of full-thrust dv).
-    crit_ref  = 3.0 * max_a * dt
-    crit_coef = 6.0 * np.log(2.0) / (crit_ref ** 2)
-
     # prenitialize values
     prev_los   = None
     prev_vel   = None
-    # single-pole EMA over the track and effort scores (window K=16 ticks ≈ 0.25s).
-    # seeded at 1.0 so a smoothly-controlling drone isn't punished by a startup
-    # transient; bad behavior pulls it down as the EMA mixes in the real values.
-    K_smooth     = 16
-    alpha_smooth = 1.0 / K_smooth
+    # single-pole EMA over the track and effort scores (window K=5 ticks).
+    # tighter window than the old K=16 so the score follows a fast-moving target
+    # with less lag. seeded at 1.0 so a smoothly-controlling drone isn't punished by
+    # a startup transient; bad behavior pulls it down as the EMA mixes in real values.
+    K_smooth     = 5
+    alpha_smooth = 1.0 / K_smooth   # = 0.2
     ema_effort   = np.ones((N, S), dtype=np.float32)
     ema_track    = np.ones((N, S), dtype=np.float32)
     time = 0
@@ -431,7 +442,13 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
 
         # PROGRESS SIMULATION --------------------------------------------------------------
         # check if touched waypoint
-        toggle |= dist < 0.5
+        touching = dist < 0.5
+        toggle |= touching
+
+        # time-pressure counter: reset on touch, else increment. computed BEFORE the score
+        # so a touch tick gets full credit (discount = touch_gamma ** 0 = 1).
+        ticks_since_touch = np.where(touching, 0, ticks_since_touch + 1)
+        discount          = touch_gamma ** ticks_since_touch
 
         # crash detection (latched): drone has flown more than crash_dist away from target.
         # zero crash tolerance: any (drone, seed) pair that ever crashes gets its FULL
@@ -486,27 +503,28 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         effort_err = projection - ideal_projection
         effort_raw = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
 
-        # criticality gate: at small err_mag (hover), criticality ≈ 0 → effort LERP'd
-        # to 1 (suppress floor-artifact jiggle). at err_mag ≈ 6·max_a·dt (real
-        # correction needed), criticality ≈ 0.984 → raw effort passes through.
-        # quadratic exponent keeps the gate flat-near-zero for tiny err.
-        criticality     = 1.0 - np.exp(-crit_coef * err_mag * err_mag)
-        effort_weighted = 1.0 - criticality * (1.0 - effort_raw)
-
-        # single-pole EMA over the gated effort score (matches track smoothing).
-        ema_effort = alpha_smooth * effort_weighted + (1.0 - alpha_smooth) * ema_effort
+        # single-pole EMA over the RAW effort score (criticality gate removed — the
+        # nested-headroom (1-track) factor below now gates when effort matters).
+        ema_effort = alpha_smooth * effort_raw + (1.0 - alpha_smooth) * ema_effort
         effort = ema_effort
 
-        # FINAL velocity score = track * effort * proximity ------------------------------
+        # FINAL score = nested-headroom priority cascade: distance > tracking > effort.
+        # prox is the floor; tracking may spend only the (1-prox) distance headroom;
+        # effort may spend only the (1-track) sub-headroom inside that. closeness is
+        # never vetoed (d_score/d_prox = 1 - LAMBDA*bridge >= 1 - LAMBDA > 0). per-tick
+        # score stays in [0,1], = 1 only at the target (prox=1). ------------------------
         x_norm = dist * inv_L
         prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
         pretouch_scale = np.where(toggle, 1.0, 1.0)
 
-        score = track * effort * prox  * pretouch_scale
+        bridge = track + MU_BRIDGE * (1.0 - track) * effort
+        # time-pressure discount scales the whole score (closeness included); a touching
+        # tick has discount = 1, time spent away bleeds it toward 0.
+        score  = (prox + LAMBDA_BRIDGE * (1.0 - prox) * bridge) * pretouch_scale * discount
         fitness_velo += dt * score                          # (N, S) final fitness
-        track_velo   += dt * track                          # ema-smoothed track quality
-        effort_velo  += dt * effort                         # ema-smoothed effort quality
-        scale_velo   += dt * prox * pretouch_scale          # combined scaling (prox * pretouch)
+        track_velo   += dt * track                          # ema-smoothed track quality (raw, undiscounted)
+        effort_velo  += dt * effort                         # ema-smoothed effort quality (raw, undiscounted)
+        scale_velo   += dt * prox * pretouch_scale          # combined scaling (raw, undiscounted)
 
         if log_per_tick:
             tick_fit            [:, :, total_ticks] = dt * score
@@ -514,8 +532,10 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
             tick_effort         [:, :, total_ticks] = dt * effort            # ema-smoothed
             tick_scale          [:, :, total_ticks] = dt * prox * pretouch_scale
             tick_track_raw      [:, :, total_ticks] = dt * track_raw
-            tick_effort_raw     [:, :, total_ticks] = dt * effort_raw        # pre-criticality
-            tick_effort_weighted[:, :, total_ticks] = dt * effort_weighted   # post-criticality, pre-EMA
+            tick_effort_raw     [:, :, total_ticks] = dt * effort_raw        # raw effort, pre-EMA
+            tick_effort_weighted[:, :, total_ticks] = dt * effort_raw        # criticality removed; == raw
+            tick_discount       [:, :, total_ticks] = discount               # time-pressure decay (unscaled)
+            tick_rel            [:, :, total_ticks] = -delta_world           # drone pos in target frame
 
         # DESCRIPTOR CALCULATIONS ----------------------------------------------------------
         # update descriptors
@@ -595,6 +615,8 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         stats_out['tick_track_raw']       = tick_track_raw      [:, :, :total_ticks]
         stats_out['tick_effort_raw']      = tick_effort_raw     [:, :, :total_ticks]
         stats_out['tick_effort_weighted'] = tick_effort_weighted[:, :, :total_ticks]
+        stats_out['tick_discount']        = tick_discount       [:, :, :total_ticks]
+        stats_out['tick_rel']             = tick_rel            [:, :, :total_ticks]
         stats_out['dt']                   = dt
 
     return individuals, stats_out

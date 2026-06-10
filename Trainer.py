@@ -136,7 +136,7 @@ if __name__=='__main__':
                     # absolute-delta plateau gate. 0.01 in log-fitness space ≈ 1% improvement
                     # in pre-log space (log(1.01) ≈ 0.01). robust to small top10_old values.
                     # raise threshold if gen-to-gen noise on top10 turns out > 0.01.
-                    if (top10 - top10_old) < 0.01 and top10 > 0:
+                    if (top10 - top10_old) / top10_old < 0.01 and top10 > 0:
                         # update curriculum at pool end
                         if settings['length'] < MAX_LENGTH:
                             settings['length'] *= 1.05

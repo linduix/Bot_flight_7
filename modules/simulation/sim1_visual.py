@@ -230,15 +230,14 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
     floor = 0.5    # hover tolerance for the tracking scale, m/s
     effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
 
+    # nested-headroom score knobs (mirror sim1.py; both in [0,1]).
+    LAMBDA_BRIDGE = 0.7  # fraction of the (1-prox) distance headroom tracking may fill
+    MU_BRIDGE     = 0.2  # fraction of the (1-track) tracking headroom effort may fill
+
     # scale shape: f(x) = 1/(K·(x+A)) − A, mirrors sim1.py.
     SCALE_A = 1.0 / 15.0
     SCALE_K = 225.0 / 16.0
     inv_L   = 1.0 / settings['length']
-
-    # criticality gate for effort (mirrors sim1.py). quadratic exponent,
-    # ~closed at hover, ~open at err_mag = 6·max_a·dt.
-    crit_ref  = 6.0 * max_a * dt
-    crit_coef = 6.0 * np.log(2.0) / (crit_ref ** 2)
 
     drone_surf    = build_drone_surf(drone_conf['width'], drone_conf['height'], METERS_TO_PIXELS)
     thruster_surf = build_thruster_surf(drone_conf['height'] * 2, METERS_TO_PIXELS)
@@ -281,6 +280,12 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
     ticks  = np.zeros((N, S), dtype=int)
     crashed = np.zeros((N, S), dtype=bool) # latched flag: drone has flown out of bounds
     crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
+
+    # time-pressure discount (mirror sim1.py): ticks since last touch, resets on touch;
+    # score scaled by touch_gamma ** ticks_since_touch (halves every 1/3 of the episode).
+    ticks_since_touch = np.zeros((N, S), dtype=np.int64)
+    halflife_ticks    = max(1.0, np.ceil(settings['limit'] / dt) / 3.0)
+    touch_gamma       = float(0.5 ** (1.0 / halflife_ticks))
     particles = ParticlePool(max_particles=4000)
     arangeS  = np.arange(S)
     prev_los = None
@@ -423,14 +428,19 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
             action_matrix = Brain.forward(obs, alive=alive_drones, prev_actions=action_matrix)
 
         # PROGRESS SIMULATION
-        toggle |= dist < 0.5
+        touching = dist < 0.5
+        toggle |= touching
+
+        # time-pressure counter: reset on touch, else increment (mirror sim1.py).
+        ticks_since_touch = np.where(touching, 0, ticks_since_touch + 1)
+        discount          = touch_gamma ** ticks_since_touch
 
         # crash detection (latched): drone has flown more than crash_dist away from target.
         # zero crash tolerance: any (drone, seed) pair that ever crashes gets its FULL
         # episode total zeroed at the end of the sim — not just post-crash ticks.
         crashed |= dist > crash_dist
 
-        # FITNESS (track * effort * prox, mirror sim1.py) ---------------------------------
+        # FITNESS (nested-headroom cascade: distance > tracking > effort; mirror sim1.py) --
         # SHARED ideal velocity (used by both components)
         v_tgt_par    = (v_target * np.conj(los_u)).real
         safe_v       = 0.8 * np.sqrt(2 * max_a * (dist + eps_d))
@@ -459,18 +469,17 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
 
         prev_vel   = vel_world
         effort_err = projection - ideal_projection
-        effort_raw = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)
+        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)  # raw, criticality gate removed
 
-        # criticality gate (mirrors sim1.py): suppresses effort jiggle during hover.
-        criticality = 1.0 - np.exp(-crit_coef * err_mag * err_mag)
-        effort      = 1.0 - criticality * (1.0 - effort_raw)
-
-        # FINAL = track * effort * prox * pretouch (matches sim1.py raw scoring)
+        # FINAL = nested-headroom cascade (mirror sim1.py): prox is the floor, tracking
+        # spends only the (1-prox) headroom, effort spends only the (1-track) sub-headroom.
         x_norm = dist * inv_L
         prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
         pretouch_scale = np.where(toggle, 1.0, 1.0)
 
-        score = track * effort * prox * pretouch_scale
+        bridge = track + MU_BRIDGE * (1.0 - track) * effort
+        # time-pressure discount scales the whole score (mirror sim1.py).
+        score  = (prox + LAMBDA_BRIDGE * (1.0 - prox) * bridge) * pretouch_scale * discount
         fitness     += dt * score
         track_velo  += dt * track                       # raw track quality
         effort_velo += dt * effort                      # raw effort quality

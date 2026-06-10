@@ -48,12 +48,20 @@ if __name__ == "__main__":
     _, stats = sim(elites, settings, seed=seed, log_per_tick=True)
 
     tick_fit             = stats['tick_fit']               # (N, S, T)
-    tick_track           = stats['tick_track']             # ema-smoothed
-    tick_effort          = stats['tick_effort']            # ema-smoothed (post-criticality)
+    tick_track           = stats['tick_track']             # ema-smoothed track quality
+    tick_effort          = stats['tick_effort']            # ema-smoothed effort quality (no gate)
     tick_scale           = stats['tick_scale']
-    tick_track_raw       = stats['tick_track_raw']         # pre-EMA
-    tick_effort_raw      = stats['tick_effort_raw']        # pre-criticality, pre-EMA
-    tick_effort_weighted = stats['tick_effort_weighted']   # post-criticality, pre-EMA
+    tick_track_raw       = stats['tick_track_raw']         # raw, pre-EMA
+    tick_effort_raw      = stats['tick_effort_raw']        # raw, pre-EMA
+    tick_effort_weighted = stats['tick_effort_weighted']   # criticality removed; == tick_effort_raw
+    tick_discount        = stats['tick_discount']          # time-pressure decay, gamma**ticks_since_touch
+    tick_rel             = stats['tick_rel']               # drone pos in target frame (complex)
+    # distance to target, logged at collection. floored at LOG_EPS so hovering right
+    # on the target stays finite. all distance-based plots use this log scale — the
+    # raw range spans orders of magnitude (cm hover vs far approach), so log spreads
+    # the interesting near-target behavior instead of crushing it against zero.
+    LOG_EPS              = 1e-2
+    tick_dist            = np.log10(np.maximum(np.abs(tick_rel), LOG_EPS))  # (N, S, T) log10 distance
     dt                   = stats['dt']
     N, S, T              = tick_fit.shape
 
@@ -76,27 +84,47 @@ if __name__ == "__main__":
     # line, since the criticality gate is part of the signal pipeline. raw raw
     # (pre-criticality) is no longer plotted — too misleading once criticality is on.
     fit_signal             = tick_fit            [best_d, best_s]      # dt-scaled reward increments
-    scale_signal           = tick_scale          [best_d, best_s] / dt
-    track_signal           = tick_track          [best_d, best_s] / dt # ema'd
-    effort_signal          = tick_effort         [best_d, best_s] / dt # ema'd
-    track_raw_signal       = tick_track_raw      [best_d, best_s] / dt # raw
-    effort_weighted_signal = tick_effort_weighted[best_d, best_s] / dt # post-criticality, pre-EMA
+    scale_signal    = tick_scale   [best_d, best_s] / dt
+    track_signal    = tick_track   [best_d, best_s] / dt   # ema'd track quality
+    effort_signal   = tick_effort  [best_d, best_s] / dt   # ema'd effort quality
+    discount_signal = tick_discount[best_d, best_s]        # already a [0,1] factor, not dt-scaled
 
-    cum_fit = np.cumsum(fit_signal)
-    time    = np.arange(T) * dt
+    # nested-headroom gating (keep LAMBDA/MU in sync with sim1.py). pre-gate = the
+    # component's raw quality in [0,1] (what it achieved); post-gate = its actual
+    # additive contribution to the per-tick score after the headroom leverage:
+    #   score = prox + LAMBDA(1-prox)*track + LAMBDA*MU(1-prox)(1-track)*effort
+    LAMBDA_BRIDGE = 0.7
+    MU_BRIDGE     = 0.2
+    track_pre   = track_signal
+    track_post  = LAMBDA_BRIDGE * (1.0 - scale_signal) * track_signal
+    effort_pre  = effort_signal
+    effort_post = LAMBDA_BRIDGE * MU_BRIDGE * (1.0 - scale_signal) * (1.0 - track_signal) * effort_signal
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    cum_fit  = np.cumsum(fit_signal)
+    time     = np.arange(T) * dt
+    rel_best = tick_rel[best_d, best_s]                  # drone pos in target frame (complex)
+    fit_pt   = fit_signal / dt                           # per-tick fitness (for trajectory color)
 
-    ax = axes[0, 0]
+    # 2x3 layout: four signal time-series on the left/middle, target-centered
+    # trajectory map spanning the full right column (square, gets the most room).
+    fig = plt.figure(figsize=(18, 9))
+    gs  = fig.add_gridspec(2, 3)
+    ax_cum    = fig.add_subplot(gs[0, 0])
+    ax_track  = fig.add_subplot(gs[0, 1])
+    ax_effort = fig.add_subplot(gs[1, 0])
+    ax_scale  = fig.add_subplot(gs[1, 1])
+    ax_traj   = fig.add_subplot(gs[:, 2])
+
+    ax = ax_cum
     ax.plot(time, cum_fit, color='C0')
     ax.set_title(f'cumulative fitness — drone {best_d}, seed {best_s} (final={cum_fit[-1]:.3f})')
     ax.set_xlabel('time (s)')
     ax.set_ylabel('cum fitness')
     ax.grid(alpha=0.3)
 
-    def plot_ema_with_raw(ax, raw, ema, color, title, ylabel, raw_label='raw'):
-        ax.plot(time, raw, color='gray', alpha=0.3, linewidth=0.6, label=raw_label)
-        ax.plot(time, ema, color=color, linewidth=1.3,            label='ema (training)')
+    def plot_pre_post(ax, pre, post, color, title, ylabel):
+        ax.plot(time, pre,  color='gray', alpha=0.45, linewidth=0.9, label='pre-gate (quality)')
+        ax.plot(time, post, color=color,  linewidth=1.3,             label='post-gate (score contribution)')
         ax.set_title(title)
         ax.set_xlabel('time (s)')
         ax.set_ylabel(ylabel)
@@ -104,19 +132,44 @@ if __name__ == "__main__":
         ax.grid(alpha=0.3)
         ax.legend(loc='lower right', fontsize=8)
 
-    plot_ema_with_raw(axes[0, 1], track_raw_signal,       track_signal,  'C1',
-                      'track quality (training signal)',  'track',  raw_label='raw')
-    plot_ema_with_raw(axes[1, 0], effort_weighted_signal, effort_signal, 'C2',
-                      'effort quality (weighted vs weighted+EMA)', 'effort', raw_label='weighted')
+    plot_pre_post(ax_track,  track_pre,  track_post,  'C1',
+                  'track — quality vs score contribution', 'track')
+    plot_pre_post(ax_effort, effort_pre, effort_post, 'C2',
+                  'effort — quality vs score contribution', 'effort')
 
-    # scale has no EMA — single line
-    ax = axes[1, 1]
-    ax.plot(time, scale_signal, color='C3', linewidth=1.0)
-    ax.set_title('scale')
+    # scale (proximity, no EMA) + time-pressure discount overlaid. both in [0,1]:
+    # where discount dips below 1 while scale is still high = "near but not touching"
+    # (drone lingering inside the prox band but never dipping under the 0.5 touch radius).
+    ax = ax_scale
+    ax.plot(time, scale_signal,    color='C3', linewidth=1.0, label='scale (prox)')
+    ax.plot(time, discount_signal, color='gray', linewidth=1.0, alpha=0.7,
+            linestyle='--', label='time discount')
+    ax.set_title('scale + time-pressure discount')
     ax.set_xlabel('time (s)')
-    ax.set_ylabel('scale')
+    ax.set_ylabel('scale / discount')
     ax.set_ylim(-0.05, 1.05)
     ax.grid(alpha=0.3)
+    ax.legend(loc='lower right', fontsize=8)
+
+    # target-centered trajectory map: target fixed at origin (red +), drone's path
+    # plotted in the target frame. each point colored by the per-tick fitness it
+    # earned there (LINEAR color scale — a log scale would hide unsaturation and
+    # other low-fitness issues). faint line shows path order; star marks the start.
+    ax = ax_traj
+    ax.plot(rel_best.real, rel_best.imag, color='gray', alpha=0.25, linewidth=0.6, zorder=1)
+    sc = ax.scatter(rel_best.real, rel_best.imag, c=fit_pt, cmap='viridis',
+                    s=12, zorder=2, vmin=0.0, vmax=max(float(fit_pt.max()), 1e-6))
+    ax.scatter([0], [0], marker='+', color='red', s=200, linewidths=2.5, zorder=4, label='target')
+    ax.scatter([rel_best.real[0]], [rel_best.imag[0]], marker='*', color='black',
+               s=120, zorder=5, label='start')
+    fig.colorbar(sc, ax=ax, label='fitness at point (per tick)', fraction=0.046, pad=0.04)
+    ax.set_title(f'trajectory in target frame — drone {best_d}, seed {best_s}\n'
+                 f'mean log₁₀ dist={tick_dist[best_d, best_s].mean():.2f}')
+    ax.set_xlabel('x − target_x')
+    ax.set_ylabel('y − target_y')
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.grid(alpha=0.3)
+    ax.legend(loc='upper right', fontsize=8)
 
     fig.suptitle(f'diagnostic — best across quartile sampling (gen {alg.gen}, seed {seed})')
     fig.tight_layout()
@@ -134,6 +187,11 @@ if __name__ == "__main__":
     #   (0,0) time-series overlay        (0,2) CCDF high-score tail
     #   (0,1) value histogram            (1,1) consecutive-streak histogram
     #   (1,0) windowed scatter vs a companion quality signal (non-circular check)
+    #   (1,2) within-episode signal vs distance (windowed, best & Q3) — does this
+    #         signal stay high while the drone is actually close to the target over
+    #         the episode? distance on x (lower = closer = better); a useful signal
+    #         sits HIGH at LOW distance -> upper-left cluster. single-drone traces,
+    #         same style as the other per-signal panels (not a per-drone·seed view).
     # =========================================================================
     PER_QUARTILE = 5  # matches pick_quartile_elites call above
     q3_start = 1 * PER_QUARTILE
@@ -260,7 +318,28 @@ if __name__ == "__main__":
         a.grid(alpha=0.3)
         a.legend(loc='upper right', fontsize=8)
 
-        ax[1, 2].axis('off')   # autocorr removed — leave slot empty
+        # (1,2) within-episode signal vs distance — raw per-tick points for best & Q3
+        # over this one episode. log₁₀ distance on the X axis, INVERTED so right =
+        # closer to target. a useful signal sits HIGH on the right (high score while
+        # close), so good behavior clusters toward the upper-RIGHT. r is best-drone's
+        # signal↔log-distance correlation.
+        a = ax[1, 2]
+        best_dist  = tick_dist[best_d,  best_s]   # log10 distance, per tick
+        worst_dist = tick_dist[worst_d, best_s]
+        a.scatter(best_dist,  best_sig,  color=color_best,  alpha=0.4, s=8, label=f'best drone {best_d}')
+        a.scatter(worst_dist, worst_sig, color=color_worst, alpha=0.4, s=8, label=f'Q3 drone {worst_d}')
+        if best_sig.size > 1 and best_dist.std() > 1e-12 and best_sig.std() > 1e-12:
+            r_sd = float(np.corrcoef(best_dist, best_sig)[0, 1])
+        else:
+            r_sd = float('nan')
+        a.set_title(f'{name} vs distance (per tick) — best r={r_sd:+.2f}\n'
+                    f'(log₁₀ dist on x, right = closer; useful signal sits high on the right)')
+        a.set_xlabel('log₁₀ distance to target')
+        a.set_ylabel(name)
+        a.set_ylim(-0.05, 1.05)
+        a.invert_xaxis()   # right = decreasing distance (closer to target)
+        a.grid(alpha=0.3)
+        a.legend(loc='upper left', fontsize=8)
 
         f.suptitle(f'{name} signal diagnostic — same seed {best_s}')
         f.tight_layout()
@@ -275,6 +354,30 @@ if __name__ == "__main__":
     best_scl  = tick_scale [best_d,  best_s] / dt
     worst_scl = tick_scale [worst_d, best_s] / dt
 
+    # per-(drone, seed) episode means: mean signal and mean distance, flattened to
+    # one entry per (drone, seed). drives the (1,2) "signal -> goal" panel.
+    ep_dist_mean   = tick_dist.mean(axis=2).flatten()              # (N*S,) lower is better
+    ep_track_mean  = (tick_track  / dt).mean(axis=2).flatten()
+    ep_effort_mean = (tick_effort / dt).mean(axis=2).flatten()
+    ep_scale_mean  = (tick_scale  / dt).mean(axis=2).flatten()
+    # correlation of each signal (and each unique signal-product pair) to mean
+    # distance, across all (drone, seed) episode means — i.e. "does a drone scoring
+    # higher on this signal actually end up closer to the target". distance is the
+    # real objective and LOWER is better, so a useful signal has NEGATIVE r. pairs
+    # use the product since fitness is multiplicative (track * effort * scale).
+    def corr_to_dist(x: np.ndarray) -> float:
+        if x.size > 1 and x.std() > 1e-12 and ep_dist_mean.std() > 1e-12:
+            return float(np.corrcoef(x, ep_dist_mean)[0, 1])
+        return float('nan')
+
+    print("signal → mean distance correlation (per drone·seed episode means; negative = good):")
+    print(f"  track            r={corr_to_dist(ep_track_mean):+.3f}")
+    print(f"  effort           r={corr_to_dist(ep_effort_mean):+.3f}")
+    print(f"  scale            r={corr_to_dist(ep_scale_mean):+.3f}")
+    print(f"  track*effort     r={corr_to_dist(ep_track_mean * ep_effort_mean):+.3f}")
+    print(f"  track*scale      r={corr_to_dist(ep_track_mean * ep_scale_mean):+.3f}")
+    print(f"  effort*scale     r={corr_to_dist(ep_effort_mean * ep_scale_mean):+.3f}")
+
     # one figure per component. companion is a different quality signal for
     # non-circular correlation check. effort↔track and track↔scale are the
     # natural pairings (independent physical levels: impulse, velocity, position).
@@ -287,19 +390,32 @@ if __name__ == "__main__":
 
     # =========================================================================
     # cross-signal pair plot — best drone, best seed.
+    # the 4th variable is DISTANCE-to-target (the real objective), replacing the
+    # old fit/tick — comparing signals against fitness was circular (they ARE
+    # fitness). now every signal can be read against the actual goal.
     # diagonal:        per-signal histogram
-    # lower triangle:  scatter of (col-signal x, row-signal y)
-    # upper triangle:  noise of row-signal binned by col-signal value
-    #                  -> answers "is signal_row noisier when signal_col is high/low?"
+    # lower triangle:  windowed-mean scatter (single drone, within-episode)
+    # upper triangle:  per-(drone, seed) episode means, colored by mean distance
+    #                  (viridis_r -> brighter = closer = better)
     # column names labeled along the top row, row names along the left column.
     # =========================================================================
-    fit_per_tick = fit_signal / dt   # per-tick reward (track * effort * scale * pretouch)
+    dist_best = tick_dist[best_d, best_s]                  # per-tick log10 distance, best drone
+    # shared log-distance axis range covering both within-episode (per-tick) and
+    # across-drone (episode-mean) distance data so nothing clips. log distance can be
+    # negative (sub-unit hover), so span [min, max] with a small pad.
+    DIST_LO = float(min(dist_best.min(), ep_dist_mean.min()))
+    DIST_HI = float(max(dist_best.max(), ep_dist_mean.max()))
+    _dpad   = 0.05 * (DIST_HI - DIST_LO) + 1e-6
 
+    UNIT = (-0.05, 1.05)                                    # [0,1] signal range
+    DLIM = (DIST_LO - _dpad, DIST_HI + _dpad)               # log-distance range
+    DIST_BINS = np.linspace(DIST_LO, DIST_HI, 41)           # diagonal hist bins for distance
+    # (name, per-tick signal, color, axis-range, is_distance)
     pair_signals = [
-        ('track',    best_trk,     'C1'),
-        ('effort',   best_eff,     'C2'),
-        ('scale',    best_scl,     'C3'),
-        ('fit/tick', fit_per_tick, 'C0'),
+        ('track',    best_trk,  'C1', UNIT, False),
+        ('effort',   best_eff,  'C2', UNIT, False),
+        ('scale',    best_scl,  'C3', UNIT, False),
+        ('log dist', dist_best, 'C0', DLIM, True),
     ]
     n_sig = len(pair_signals)
 
@@ -310,21 +426,21 @@ if __name__ == "__main__":
         n = x.size - W
         return np.array([x[t:t + W].mean() for t in range(n)], dtype=np.float32) if n > 0 else x
 
-    pair_windowed = [(name, windowed_mean(sig), color) for name, sig, color in pair_signals]
+    pair_windowed = [windowed_mean(sig) for _, sig, _, _, _ in pair_signals]
 
     # per-(drone, seed) episode means for the upper-triangle scatter — one point per
     # (drone, seed). reveals whether (sig_i, sig_j) plane *separates* good drones from
     # bad ones, which is the actual selection question. complements the lower triangle
     # (which is single-drone within-episode behavior).
-    # per-(drone, seed) episode means of each signal.
     ep_arrays = {
-        'track':    (tick_track  / dt).mean(axis=2).flatten(),
-        'effort':   (tick_effort / dt).mean(axis=2).flatten(),
-        'scale':    (tick_scale  / dt).mean(axis=2).flatten(),
-        'fit/tick': (tick_fit    / dt).mean(axis=2).flatten(),
+        'track':    ep_track_mean,
+        'effort':   ep_effort_mean,
+        'scale':    ep_scale_mean,
+        'log dist': ep_dist_mean,
     }
-    ep_drone_idx = np.broadcast_to(np.arange(N)[:, None], (N, S)).flatten()
-    ep_drone_fit = drone_se_fit[ep_drone_idx]    # color = SE fitness of that drone
+    ep_drone_idx  = np.broadcast_to(np.arange(N)[:, None], (N, S)).flatten()
+    drone_mean_dist = tick_dist.mean(axis=(1, 2))            # (N,) mean log distance per drone
+    ep_drone_dist = drone_mean_dist[ep_drone_idx]           # color = mean log distance (lower=better)
 
     def correlation_ratio(values: np.ndarray, group_idx: np.ndarray) -> float:
         # η² (eta squared) = between-group variance / total variance.
@@ -343,31 +459,34 @@ if __name__ == "__main__":
         return float(ss_between / ss_total)
 
     fig3, axes3 = plt.subplots(n_sig, n_sig, figsize=(12, 12))
-    for i, (name_i, sig_i, color_i) in enumerate(pair_signals):
-        for j, (name_j, sig_j, color_j) in enumerate(pair_signals):
+    ep_sc = None
+    for i, (name_i, sig_i, color_i, lim_i, is_dist_i) in enumerate(pair_signals):
+        for j, (name_j, sig_j, color_j, lim_j, is_dist_j) in enumerate(pair_signals):
             a = axes3[i, j]
             if i == j:
-                # DIAGONAL: histogram
-                a.hist(sig_i, bins=HIST_BINS, color=color_i, alpha=0.7)
-                a.set_xlim(-0.05, 1.05)
+                # DIAGONAL: histogram (distance gets its own bins; others use [0,1] bins)
+                bins_i = DIST_BINS if is_dist_i else HIST_BINS
+                a.hist(sig_i, bins=bins_i, color=color_i, alpha=0.7)
+                a.set_xlim(*lim_i)
                 a.set_yticks([])
             elif i > j:
                 # LOWER TRIANGLE: scatter of windowed means (matches signal_diagnostic).
-                _, win_i, _ = pair_windowed[i]
-                _, win_j, _ = pair_windowed[j]
+                win_i = pair_windowed[i]
+                win_j = pair_windowed[j]
                 a.scatter(win_j, win_i, color='gray', alpha=0.4, s=4)
                 r = float(np.corrcoef(win_j, win_i)[0, 1]) if win_i.size > 1 else float('nan')
                 a.text(0.03, 0.97, f'r={r:+.2f} (W={W_pair})', transform=a.transAxes,
                        va='top', fontsize=8,
                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-                a.set_xlim(-0.05, 1.05)
-                a.set_ylim(-0.05, 1.05)
+                a.set_xlim(*lim_j)
+                a.set_ylim(*lim_i)
             else:
-                # UPPER TRIANGLE: per-(drone, seed) episode means, colored by drone fitness.
+                # UPPER TRIANGLE: per-(drone, seed) episode means, colored by the drone's
+                # mean distance to target (viridis_r -> brighter = closer = better).
                 ep_x = ep_arrays[name_j]
                 ep_y = ep_arrays[name_i]
-                a.scatter(ep_x, ep_y, c=ep_drone_fit, cmap='viridis',
-                          alpha=0.7, s=14, edgecolors='none')
+                ep_sc = a.scatter(ep_x, ep_y, c=ep_drone_dist, cmap='viridis_r',
+                                  alpha=0.7, s=14, edgecolors='none')
                 if ep_x.size > 1:
                     r_ep = float(np.corrcoef(ep_x, ep_y)[0, 1])
                 else:
@@ -380,8 +499,20 @@ if __name__ == "__main__":
                 a.text(0.03, 0.97, f'r={r_ep:+.2f}  η²={eta2:.2f}',
                        transform=a.transAxes, va='top', fontsize=8,
                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none'))
-                a.set_xlim(-0.05, 1.05)
-                a.set_ylim(-0.05, 1.05)
+                a.set_xlim(*lim_j)
+                a.set_ylim(*lim_i)
+
+            # flip distance axes so the GOOD end (distance -> 0) lands where the other
+            # signals' good end (value -> 1) is: top / right. keeps "good" in the same
+            # corner of every panel. diagonal x is signal i; off-diagonal x is signal j.
+            if i == j:
+                if is_dist_i:
+                    a.invert_xaxis()
+            else:
+                if is_dist_j:
+                    a.invert_xaxis()
+                if is_dist_i:
+                    a.invert_yaxis()
 
             # column header on the top row (read along the top to identify columns)
             if i == 0:
@@ -398,9 +529,12 @@ if __name__ == "__main__":
 
     fig3.suptitle(f'cross-signal pair plot — best drone {best_d}, seed {best_s}\n'
                   f'lower = single-drone windowed scatter (within-episode),  '
-                  f'upper = per-(drone, seed) episode means (across drones, color = SE fitness)',
+                  f'upper = per-(drone, seed) episode means (across drones, color = mean distance, brighter=closer)',
                   fontsize=10)
     fig3.tight_layout()
+    if ep_sc is not None:
+        fig3.colorbar(ep_sc, ax=axes3, label='mean log₁₀ distance to target (lower = better)',
+                      fraction=0.025, pad=0.01)
     fig3.savefig('diagnostic_pairs.png', dpi=150)
 
     plt.show()
