@@ -48,8 +48,8 @@ if __name__ == "__main__":
     _, stats = sim(elites, settings, seed=seed, log_per_tick=True)
 
     tick_fit             = stats['tick_fit']               # (N, S, T)
-    tick_track           = stats['tick_track']             # ema-smoothed track quality
-    tick_effort          = stats['tick_effort']            # ema-smoothed effort quality (no gate)
+    tick_track           = stats['tick_track']             # ema-smoothed (K=4) track quality
+    tick_effort          = stats['tick_effort']            # ema-smoothed (K=16) effort quality (no gate)
     tick_scale           = stats['tick_scale']
     tick_track_raw       = stats['tick_track_raw']         # raw, pre-EMA
     tick_effort_raw      = stats['tick_effort_raw']        # raw, pre-EMA
@@ -79,10 +79,9 @@ if __name__ == "__main__":
           f"se_fit={drone_se_fit[best_d]:.3f} "
           f"descr={ind.descriptors}")
 
-    # extract signals for the chosen (drone, seed). EMA'd are what training saw.
-    # for effort: show WEIGHTED (post-criticality, pre-EMA) as the "raw"-equivalent
-    # line, since the criticality gate is part of the signal pipeline. raw raw
-    # (pre-criticality) is no longer plotted — too misleading once criticality is on.
+    # extract signals for the chosen (drone, seed). EMA'd values are what training saw:
+    # tracking is EMA'd at K=4, effort at K=16. there is no criticality gate (removed) —
+    # effort is the raw projection-match score straight into its EMA.
     fit_signal             = tick_fit            [best_d, best_s]      # dt-scaled reward increments
     scale_signal    = tick_scale   [best_d, best_s] / dt
     track_signal    = tick_track   [best_d, best_s] / dt   # ema'd track quality
@@ -93,8 +92,8 @@ if __name__ == "__main__":
     # component's raw quality in [0,1] (what it achieved); post-gate = its actual
     # additive contribution to the per-tick score after the headroom leverage:
     #   score = prox + LAMBDA(1-prox)*track + LAMBDA*MU(1-prox)(1-track)*effort
-    LAMBDA_BRIDGE = 0.7
-    MU_BRIDGE     = 0.2
+    LAMBDA_BRIDGE = 0.95
+    MU_BRIDGE     = 0.30
     track_pre   = track_signal
     track_post  = LAMBDA_BRIDGE * (1.0 - scale_signal) * track_signal
     effort_pre  = effort_signal

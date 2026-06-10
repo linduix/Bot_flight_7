@@ -228,7 +228,7 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
     eps   = 1e-8
     eps_d = 0.05
     floor = 0.5    # hover tolerance for the tracking scale, m/s
-    effort_floor = 0.15  # min divisor for effort score so near-zero err_v doesn't demand impossible precision
+    effort_floor = 0.05 * max_a * dt  # 5% of the dv budget; min divisor so near-zero err_v doesn't demand impossible precision
 
     # nested-headroom score knobs (mirror sim1.py; both in [0,1]).
     LAMBDA_BRIDGE = 0.7  # fraction of the (1-prox) distance headroom tracking may fill
@@ -291,12 +291,22 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
     prev_los = None
     prev_vel = None
 
+    # single-pole EMAs over the score components (mirrors sim1.py). effort uses a long K=16
+    # window, tracking a tight K=4 window (noisy velocity error, but responsive). both
+    # seeded at 1.0 so a startup transient doesn't punish a smooth controller.
+    K_effort     = 16
+    alpha_effort = 1.0 / K_effort   # = 0.0625
+    K_track      = 4
+    alpha_track  = 1.0 / K_track    # = 0.25
+    ema_effort   = np.ones((N, S))
+    ema_track    = np.ones((N, S))
+
     # fitness + descriptor accumulators
     # descriptors: mean gimbal angle, activation variance
     fitness     = np.zeros((N, S))
-    track_velo  = np.zeros((N, S))   # raw track sum, sum(dt * track)
-    effort_velo = np.zeros((N, S))   # raw effort sum, sum(dt * effort)
-    scale_velo  = np.zeros((N, S))   # scaling sum, sum(dt * prox * pretouch_scale)
+    track_velo  = np.zeros((N, S))   # ema track sum, sum(dt * track)
+    effort_velo = np.zeros((N, S))   # ema effort sum, sum(dt * effort)
+    scale_velo  = np.zeros((N, S))   # scaling sum, sum(dt * prox)
     sum_acti  = np.zeros((N, 4, S))
     sum_acti2 = np.zeros((N, 4, S))
     mean_gimb = np.zeros(N)
@@ -395,12 +405,15 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)
         zem = delta_local - rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2
         zev = v_target_local - vel + grav_body * tti_raw
+        # raw acceleration commands (kept for scoring/visual reuse — bounded by gravity)
         zem_a = zem / (tti_raw ** 2 + eps)
         zev_a = zev / (tti_raw + eps)
-        zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
-        zev_a = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
-        zema_mag = np.abs(zem_a); zema_u = zem_a / (zema_mag + eps)
-        zeva_mag = np.abs(zev_a); zeva_u = zev_a / (zeva_mag + eps)
+        # obs features: tanh-capped to max_a and split into unit dir + magnitude in [0,1].
+        # built as separate variables so zem_a/zev_a stay as raw accelerations.
+        zema_cap = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
+        zeva_cap = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
+        zema_mag = np.abs(zema_cap); zema_u = zema_cap / (zema_mag + eps)
+        zeva_mag = np.abs(zeva_cap); zeva_u = zeva_cap / (zeva_mag + eps)
 
         # --- attitude / actuators ---
         ang_vel   = state_matrix[:, 3, :].real
@@ -448,42 +461,66 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         safe_v_term  = safe_v * smooth_scale
         ideal_vel    = v_target + safe_v_term * los_u
 
+        # ZEM/ZEV-derived ideal velocity — overlay only, not wired into scoring. zem/zev
+        # are integrated over the full tti horizon, so using them directly as velocity
+        # compensation double-counts time and explodes when tti is large. Use the raw
+        # ACCELERATION commands (zem_a, zev_a from the obs block) which stay bounded by
+        # gravity even as tti blows up, and convert to per-tick velocity increments via *dt.
+        ideal_vel_zev = (vel + (zem_a + zev_a) * dt) * np.exp(1j * angle)
+
+        # PURELY PREDICTIVE ideal velocity — what the drone's velocity SHOULD be right now
+        # for clean interception, independent of its current state. ZEM/ZEV's anticipation
+        # contribution collapses to leading the target's future position: match target
+        # motion (v_target) + close the geometric gap over the planning horizon (delta/t_go).
+        # t_go = sign-aware clipped tti_raw: positives in [dt, 1.0], negatives routed to
+        # the 1s ceiling (drone moving away — gentle decel back, not a one-tick snap).
+        t_go         = np.where(tti_raw > 0, np.clip(tti_raw, dt, 1.0), 1.0)
+        ideal_vel_dt = v_target + delta_world / t_go
+
         # TRACKING component (vratio): achieved velocity vs ideal_vel
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
         track_scale = np.maximum(np.abs(ideal_vel), floor)
-        track = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+        track_raw   = np.clip(1.0 - (track_err / track_scale) ** 2, 0.0, 1.0)
+
+        # single-pole EMA on tracking (K=4; mirrors sim1.py) — smooths noisy velocity error.
+        ema_track = alpha_track * track_raw + (1.0 - alpha_track) * ema_track
+        track = ema_track
 
         # EFFORT component (regime-aware projection match) — mirrors sim1.py
         v_free = prev_vel + -9.81j * dt
-        # per-tick dv budget scaled by rate-limited throttle delta (mirrors sim1.py)
-        dv = max_a * dt * (drone_conf['th_actuation_rate'] * dt)
+        # per-tick impulse capacity = max_a * dt (mirrors sim1.py; slew factor dropped).
+        dv = max_a * dt
 
         err_v    = ideal_vel - v_free
         err_mag  = np.abs(err_v)
         err_unit = err_v / (err_mag + eps)
 
         actual_dv        = state_matrix[:, 1, :] - v_free
-        projection       = (actual_dv * np.conjugate(err_unit)).real
-        ideal_projection = np.minimum(err_mag, dv)
+        ideal_projection = np.minimum(err_mag, dv)          # capped ideal magnitude along err
+        ideal_effort     = err_unit * ideal_projection      # full 2-D ideal effort vector (û · p*)
         effort_divisor   = np.maximum(ideal_projection, effort_floor)
 
         prev_vel   = vel_world
-        effort_err = projection - ideal_projection
-        effort     = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)  # raw, criticality gate removed
+        # 2-D miss vs the capped ideal vector (mirrors sim1.py; charges perpendicular waste).
+        effort_err = np.abs(actual_dv - ideal_effort)
+        effort_raw = np.clip(1.0 - (effort_err / effort_divisor) ** 2, 0.0, 1.0)  # raw, criticality gate removed
+
+        # single-pole EMA over the raw effort score (window K=16; mirrors sim1.py).
+        ema_effort = alpha_effort * effort_raw + (1.0 - alpha_effort) * ema_effort
+        effort     = ema_effort
 
         # FINAL = nested-headroom cascade (mirror sim1.py): prox is the floor, tracking
         # spends only the (1-prox) headroom, effort spends only the (1-track) sub-headroom.
         x_norm = dist * inv_L
         prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
-        pretouch_scale = np.where(toggle, 1.0, 1.0)
 
         bridge = track + MU_BRIDGE * (1.0 - track) * effort
         # time-pressure discount scales the whole score (mirror sim1.py).
-        score  = (prox + LAMBDA_BRIDGE * (1.0 - prox) * bridge) * pretouch_scale * discount
+        score  = (prox + LAMBDA_BRIDGE * (1.0 - prox) * bridge) * discount
         fitness     += dt * score
-        track_velo  += dt * track                       # raw track quality
-        effort_velo += dt * effort                      # raw effort quality
-        scale_velo  += dt * prox * pretouch_scale       # combined scaling
+        track_velo  += dt * track                       # ema track quality
+        effort_velo += dt * effort                      # ema effort quality
+        scale_velo  += dt * prox                        # proximity scaling
 
         # descriptors
         normalized = action_matrix / np.array([1, 1, 2, 2]).reshape(1, 4, 1)
@@ -566,8 +603,10 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
                 cur_v = state_matrix[highlight, 1, 0]
                 VS  = 0.4   # shared velocity scale
                 AMP = 5.0   # amplify the tiny per-tick thrust impulses so they're visible
-                draw_vector(screen, base_pos, ideal_vel[highlight, 0], (230, 90, 220), scale=VS)  # track target
-                draw_vector(screen, base_pos, cur_v,                   (80, 200, 255), scale=VS)  # current v
+                draw_vector(screen, base_pos, ideal_vel[highlight, 0],     (230, 90, 220), scale=VS)  # track target
+                draw_vector(screen, base_pos, ideal_vel_zev[highlight, 0], (180, 255, 40),  scale=VS)  # ZEM/ZEV (tti horizon, dt-step)
+                draw_vector(screen, base_pos, ideal_vel_dt[highlight, 0],  (255, 230, 80),  scale=VS)  # ZEM/ZEV (dt horizon)
+                draw_vector(screen, base_pos, cur_v,                       (80, 200, 255), scale=VS)  # current v
 
                 # both impulse arrows rooted at the v_free tip — directly comparable.
                 # ORANGE = optimal thrust impulse: err_unit * ideal_projection (= min(|err_v|, dv))
@@ -584,6 +623,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
                 screen.blit(font.render("ideal dv (err_unit * ideal_proj)", True, (255, 170, 40)), (10, 64))
                 screen.blit(font.render("actual dv this tick", True, (255, 80, 80)), (10, 88))
                 screen.blit(font.render("ideal v (track target)", True, (230, 90, 220)), (10, 112))
+                screen.blit(font.render("ideal v (ZEM/ZEV)", True, (180, 255, 40)), (10, 160))
+                screen.blit(font.render("ideal v (ZEM/ZEV, dt horizon)", True, (255, 230, 80)), (10, 184))
 
         fps = clock.get_fps()
         # tooltips describe what pressing the key would do FROM the current mode.
