@@ -406,8 +406,8 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
 
         # --- guidance accel commands: ZEM/ZEV at t_go = tti_raw w/ gravity -> PN form, mag-capped ---
         grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)  # world gravity -> body frame
-        zem = delta_local - rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2
-        zev = v_target_local - vel + grav_body * tti_raw
+        zem = delta_local - (rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2)
+        zev = v_target_local - (vel + grav_body * tti_raw)
         zem_a = zem / (tti_raw ** 2 + eps)
         zev_a = zev / (tti_raw + eps)
         zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)

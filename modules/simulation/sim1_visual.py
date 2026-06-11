@@ -403,17 +403,14 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
 
         # --- guidance accel commands: ZEM/ZEV at t_go = tti_raw w/ gravity -> PN form, mag-capped ---
         grav_body = (-1j * drone_conf['G']) * np.exp(-1j * angle)
-        zem = delta_local - rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2
-        zev = v_target_local - vel + grav_body * tti_raw
-        # raw acceleration commands (kept for scoring/visual reuse — bounded by gravity)
+        zem = delta_local - (rel_vel * tti_raw + 0.5 * grav_body * tti_raw ** 2)
+        zev = v_target_local - (vel + grav_body * tti_raw)
         zem_a = zem / (tti_raw ** 2 + eps)
         zev_a = zev / (tti_raw + eps)
-        # obs features: tanh-capped to max_a and split into unit dir + magnitude in [0,1].
-        # built as separate variables so zem_a/zev_a stay as raw accelerations.
-        zema_cap = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
-        zeva_cap = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
-        zema_mag = np.abs(zema_cap); zema_u = zema_cap / (zema_mag + eps)
-        zeva_mag = np.abs(zeva_cap); zeva_u = zeva_cap / (zeva_mag + eps)
+        zem_a = zem_a / (np.abs(zem_a) + eps) * np.tanh(np.abs(zem_a) / max_a)
+        zev_a = zev_a / (np.abs(zev_a) + eps) * np.tanh(np.abs(zev_a) / max_a)
+        zema_mag = np.abs(zem_a); zema_u = zem_a / (zema_mag + eps)
+        zeva_mag = np.abs(zev_a); zeva_u = zev_a / (zeva_mag + eps)
 
         # --- attitude / actuators ---
         ang_vel   = state_matrix[:, 3, :].real
@@ -460,22 +457,6 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
         smooth_scale = np.clip(dist / 0.5, 0.0, 1.0)
         safe_v_term  = safe_v * smooth_scale
         ideal_vel    = v_target + safe_v_term * los_u
-
-        # ZEM/ZEV-derived ideal velocity — overlay only, not wired into scoring. zem/zev
-        # are integrated over the full tti horizon, so using them directly as velocity
-        # compensation double-counts time and explodes when tti is large. Use the raw
-        # ACCELERATION commands (zem_a, zev_a from the obs block) which stay bounded by
-        # gravity even as tti blows up, and convert to per-tick velocity increments via *dt.
-        ideal_vel_zev = (vel + (zem_a + zev_a) * dt) * np.exp(1j * angle)
-
-        # PURELY PREDICTIVE ideal velocity — what the drone's velocity SHOULD be right now
-        # for clean interception, independent of its current state. ZEM/ZEV's anticipation
-        # contribution collapses to leading the target's future position: match target
-        # motion (v_target) + close the geometric gap over the planning horizon (delta/t_go).
-        # t_go = sign-aware clipped tti_raw: positives in [dt, 1.0], negatives routed to
-        # the 1s ceiling (drone moving away — gentle decel back, not a one-tick snap).
-        t_go         = np.where(tti_raw > 0, np.clip(tti_raw, dt, 1.0), 1.0)
-        ideal_vel_dt = v_target + delta_world / t_go
 
         # TRACKING component (vratio): achieved velocity vs ideal_vel
         track_err   = np.abs(state_matrix[:, 1, :] - ideal_vel)
@@ -603,10 +584,8 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
                 cur_v = state_matrix[highlight, 1, 0]
                 VS  = 0.4   # shared velocity scale
                 AMP = 5.0   # amplify the tiny per-tick thrust impulses so they're visible
-                draw_vector(screen, base_pos, ideal_vel[highlight, 0],     (230, 90, 220), scale=VS)  # track target
-                draw_vector(screen, base_pos, ideal_vel_zev[highlight, 0], (180, 255, 40),  scale=VS)  # ZEM/ZEV (tti horizon, dt-step)
-                draw_vector(screen, base_pos, ideal_vel_dt[highlight, 0],  (255, 230, 80),  scale=VS)  # ZEM/ZEV (dt horizon)
-                draw_vector(screen, base_pos, cur_v,                       (80, 200, 255), scale=VS)  # current v
+                draw_vector(screen, base_pos, ideal_vel[highlight, 0], (230, 90, 220), scale=VS)  # track target
+                draw_vector(screen, base_pos, cur_v,                   (80, 200, 255), scale=VS)  # current v
 
                 # both impulse arrows rooted at the v_free tip — directly comparable.
                 # ORANGE = optimal thrust impulse: err_unit * ideal_projection (= min(|err_v|, dv))
@@ -623,8 +602,6 @@ def sim(individuals: list[Individual], settings, seed=None, featured=None, updat
                 screen.blit(font.render("ideal dv (err_unit * ideal_proj)", True, (255, 170, 40)), (10, 64))
                 screen.blit(font.render("actual dv this tick", True, (255, 80, 80)), (10, 88))
                 screen.blit(font.render("ideal v (track target)", True, (230, 90, 220)), (10, 112))
-                screen.blit(font.render("ideal v (ZEM/ZEV)", True, (180, 255, 40)), (10, 160))
-                screen.blit(font.render("ideal v (ZEM/ZEV, dt horizon)", True, (255, 230, 80)), (10, 184))
 
         fps = clock.get_fps()
         # tooltips describe what pressing the key would do FROM the current mode.
