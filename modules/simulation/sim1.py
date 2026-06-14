@@ -273,11 +273,12 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
 
     # TIME PRESSURE: ticks since the drone was last INSIDE the target (resets to 0 on
-    # every touch, instantaneous — not the latched `toggle`). per-tick score is scaled
-    # by discount = touch_gamma ** ticks_since_touch, halving every 1/3 of the episode
-    # so lingering away from the target bleeds reward; sitting on it keeps discount = 1.
+    # every touch, instantaneous — not the latched `toggle`). discount = touch_gamma **
+    # ticks_since_touch, halving every 1/5 of the episode. applied to the PROXIMITY
+    # component only (not bridge): the static-closeness floor decays but flying the
+    # guidance law (track) keeps paying — kills the pre-touch hover-near-target farm.
     ticks_since_touch = np.zeros((N, S), dtype=np.int64)
-    halflife_ticks    = max(1.0, np.ceil(settings['limit'] / dt) / 3.0)
+    halflife_ticks    = max(1.0, np.ceil(settings['limit'] / dt) / 5.0)
     touch_gamma       = float(0.5 ** (1.0 / halflife_ticks))
 
     # fitness + descriptor arrays
@@ -525,9 +526,13 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         prox = np.maximum(0.0, 1.0 / (SCALE_K * (x_norm + SCALE_A)) - SCALE_A)
 
         bridge = track + MU_BRIDGE * (1.0 - track) * effort
-        # time-pressure discount scales the whole score (closeness included); a touching
-        # tick has discount = 1, time spent away bleeds it toward 0.
-        score  = (prox + LAMBDA_BRIDGE * (1.0 - prox) * bridge) * discount
+        # time-pressure discount applied to PROXIMITY ONLY. bridge fills the (1 - prox_eff)
+        # headroom so the cascade stays in [0,1] and bridge gains headroom as prox decays:
+        # the static closeness floor bleeds away, but tracking the guidance law (which
+        # points at the target whenever you're outside it) remains fully paid. removes the
+        # pre-touch hover-near-target exploit without vetoing legitimate proximity.
+        prox_eff = prox * discount
+        score    = prox_eff + LAMBDA_BRIDGE * (1.0 - prox_eff) * bridge
         fitness_velo += dt * score                          # (N, S) final fitness
         track_velo   += dt * track                          # ema-smoothed track quality (undiscounted)
         effort_velo  += dt * effort                         # ema-smoothed effort quality (undiscounted)
