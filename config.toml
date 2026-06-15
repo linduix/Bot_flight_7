@@ -5,6 +5,11 @@ output_activation = "tanh"
 
 [trainer]
 population = 1500
+trials = 32
+
+[critic]
+tuples_per_gen = 100000
+buffer_cap = 5         # multiplier of tuples_per_gen; actual buffer size = buffer_cap * tuples_per_gen
 
 [drone]
 mass            = 4.0        # kg

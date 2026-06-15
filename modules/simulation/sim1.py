@@ -196,12 +196,27 @@ def gen_target_chain(length, limit, dt, rng, S, base_S=16) -> np.ndarray:
 
 
 # individuals + sim settings -> simulation stats
-def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool = False) -> tuple[list[Individual], dict]:
+def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int = 0, log_per_tick: bool = False) -> tuple[list[Individual], dict]:
     # get configuration
     drone_conf = get_drone_conf(config_path)
     N = len(individuals) # drones
-    S = 32                # trials per drone
+    with open(config_path, 'rb') as f:
+        _cfg = tomllib.load(f)
+        S          = _cfg['trainer']['trials']      # trials per drone
+        input_dim  = _cfg['network']['layers'][0]   # network observation width
+        action_dim = _cfg['network']['layers'][-1]  # network action width
     dt = .016
+
+    # replay buffer preallocation. tuple = (s, a, r, s'). last tick excluded from
+    # sampling so s' is always valid. ticks_per_drone draws per (drone, seed) episode.
+    tuple_width = 2 * input_dim + action_dim + 1
+    T_max = int(np.ceil(settings['limit'] / dt))
+    if ticks_per_drone > 0:
+        t_idx = np.random.randint(0, T_max - 1, size=(N, S, ticks_per_drone))   # [0, T_max-1)
+        buffer = np.zeros((N, S, ticks_per_drone, tuple_width), dtype=np.float32)
+    else:
+        t_idx  = None
+        buffer = None
     weight_penalty_coef = 1e-5   # tiny L2 penalty on genome weights, nudges toward simpler controllers
 
     # per-tick logging buffers (diagnostic only). when enabled, each tick's
@@ -271,6 +286,9 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     ticks   = np.zeros((N, S), dtype=int) # ticks since touched
     crashed = np.zeros((N, S), dtype=bool) # latched flag: drone has flown out of bounds; zeros all future fitness
     crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
+    # first-crash tick per (drone, seed). T_max sentinel = never crashed. used to drop
+    # post-crash tuples from the replay buffer while keeping pre-crash ones.
+    crash_tick = np.full((N, S), T_max, dtype=np.int32) if ticks_per_drone > 0 else None
 
     # TIME PRESSURE: ticks since the drone was last INSIDE the target (resets to 0 on
     # every touch, instantaneous — not the latched `toggle`). discount = touch_gamma **
@@ -456,7 +474,12 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         # crash detection (latched): drone has flown more than crash_dist away from target.
         # zero crash tolerance: any (drone, seed) pair that ever crashes gets its FULL
         # episode total zeroed at the end of the sim — not just post-crash ticks.
+        prev_crashed = crashed.copy() if crash_tick is not None else None
         crashed |= dist > crash_dist
+        # latch the iteration of each pair's first crash for buffer post-filtering.
+        if crash_tick is not None:
+            newly_crashed = crashed & ~prev_crashed
+            crash_tick = np.where(newly_crashed, total_ticks, crash_tick)
 
         # FITNESS CALULATIONS --------------------------------------------------------------
         # SHARED: ideal drone vel VECTOR = match target motion + approach budget along los_u.
@@ -538,6 +561,24 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
         effort_velo  += dt * effort                         # ema-smoothed effort quality (undiscounted)
         scale_velo   += dt * prox                           # proximity scaling (undiscounted)
 
+        # REPLAY BUFFER WRITES -------------------------------------------------------------
+        # tuple at sampled tick t = (s_t, a_t, r_t, s_{t+1}).
+        # at this iteration (total_ticks): obs = s_t, action_matrix = a_t, dt*score = r_{t-1}.
+        # so:  match t_idx == total_ticks       -> write s, a
+        #      match t_idx == total_ticks - 1   -> write r (this iter's score) and s' (this iter's obs)
+        if t_idx is not None:
+            match_sa = (t_idx == total_ticks)            # (N, S, k)
+            if match_sa.any():
+                n_i, s_i, k_i = np.where(match_sa)
+                buffer[n_i, s_i, k_i, :input_dim] = obs[n_i, :, s_i]
+                buffer[n_i, s_i, k_i, input_dim:input_dim + action_dim] = action_matrix[n_i, :, s_i]
+            if total_ticks > 0:
+                match_rs = (t_idx == total_ticks - 1)
+                if match_rs.any():
+                    n_i, s_i, k_i = np.where(match_rs)
+                    buffer[n_i, s_i, k_i, input_dim + action_dim] = dt * score[n_i, s_i]
+                    buffer[n_i, s_i, k_i, input_dim + action_dim + 1:] = obs[n_i, :, s_i]
+
         if log_per_tick:
             tick_fit            [:, :, total_ticks] = dt * score
             tick_track          [:, :, total_ticks] = dt * track             # ema-smoothed
@@ -569,6 +610,12 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
     track_velo   *= survived
     effort_velo  *= survived
     scale_velo   *= survived
+
+    # replay buffer: drop only the tuples whose sampled tick was at or after the
+    # (drone, seed)'s crash. pre-crash ticks from a later-crashing pair are kept.
+    if buffer is not None and crash_tick is not None and t_idx is not None:
+        valid  = t_idx < crash_tick[:, :, None]   # (N, S, ticks_per_drone)
+        buffer = buffer[valid]                    # (n_valid, tuple_width)
 
     # finalize descriptors and fitness
     var_acti = (sum_acti2 / total_ticks) - (sum_acti / total_ticks)**2 # (N, act, S)
@@ -616,7 +663,8 @@ def sim(individuals: list[Individual], settings, seed=None, log_per_tick: bool =
                  'per_track'  : track_velo.mean(axis=1),
                  'per_effort' : effort_velo.mean(axis=1),
                  'per_scale'  : scale_velo.mean(axis=1),
-                 'S'          : S}
+                 'S'          : S,
+                 'buffer'     : buffer.reshape(-1, tuple_width) if buffer is not None else None}
 
     if log_per_tick:
         # trim to actual ticks executed (in case loop exited early via all-crashed break)
@@ -640,6 +688,15 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     if cpus == 0:
         raise RuntimeError('os.cpu_count() returned None')
 
+    # replay buffer sizing — per (drone, seed) sample count.
+    # ticks_per_drone = ceil(tuples_per_gen / (pop_size * trials)).
+    with open(config_path, 'rb') as f:
+        cfg = tomllib.load(f)
+    tuples_per_gen = cfg['critic']['tuples_per_gen']
+    S              = cfg['trainer']['trials']
+    pop            = len(indivs)
+    ticks_per_drone = -(-tuples_per_gen // (pop * S))  # ceil div
+
     # create the chunks
     chunk_size = len(indivs) // max(cpus, 1)
     chunks = []
@@ -652,7 +709,7 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
             chunk = indivs[start: end]
         chunks.append(chunk)
 
-    args = [(chunk, settings, seed) for chunk in chunks]
+    args = [(chunk, settings, seed, ticks_per_drone) for chunk in chunks]
     chunk_results = Mpool.starmap(sim, args)
 
     scored = []
@@ -661,6 +718,7 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     per_fit_all, per_fit_raw_all = [], []
     per_track_all, per_effort_all, per_scale_all = [], [], []
     per_fit_std_all = []
+    buffer_chunks = []
     S_val = None
     for indvs, stat in chunk_results:
         scored.extend(indvs)
@@ -673,7 +731,34 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
         per_effort_all .append(stat['per_effort'])
         per_scale_all  .append(stat['per_scale'])
         per_fit_std_all.append(stat['per_fit_std'])
+        if stat['buffer'] is not None:
+            buffer_chunks.append(stat['buffer'])
         S_val = stat['S']
+
+    # compile replay buffers across chunks. axis 0 = episodes ((drone, seed) pairs).
+    # stats['buffer'] = np.concatenate(buffer_chunks, axis=0) if buffer_chunks else None
+    # if stats['buffer'] is not None:
+    #     buf = stats['buffer']
+    #     with open(config_path, 'rb') as f:
+    #         _c = tomllib.load(f)
+    #         in_d  = _c['network']['layers'][0]
+    #         act_d = _c['network']['layers'][-1]
+    #     np.set_printoptions(precision=3, suppress=True, linewidth=200)
+    #     print(f"\n--- buffer test log: shape {buf.shape} ---")
+    #     rows = np.random.choice(buf.shape[0], size=min(3, buf.shape[0]), replace=False)
+    #     for r in rows:
+    #         s   = buf[r, :in_d]
+    #         a   = buf[r, in_d:in_d + act_d]
+    #         rew = buf[r, in_d + act_d]
+    #         sn  = buf[r, in_d + act_d + 1:]
+    #         print(f"  row {r}:")
+    #         print(f"    s_t        = {s}")
+    #         print(f"    a_t        = {a}")
+    #         print(f"    r_t        = {rew:.6f}")
+    #         print(f"    s_{{t+1}}    = {sn}")
+    #         print(f"    ds = s'-s  = {sn - s}")
+    #     all_zero = (buf == 0).all(axis=1).sum()
+    #     print(f"  fully-zero rows: {all_zero}/{buf.shape[0]}  (should be 0 if every slot was written)")
 
     stats['fit_mean']   /= cpus
     stats['fit_velo']   /= cpus
