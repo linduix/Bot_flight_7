@@ -301,7 +301,11 @@ def load(path) -> tuple:
     # new checkpoints store only the archive + gen; old ones store the whole alg
     archive = data['archive'] if 'archive' in data else data['alg'].archive
     gen     = data['gen']     if 'gen'     in data else data['alg'].gen
-    return archive, gen, data['settings'], data['seed']
+    seed    = data['seed']
+    # backfill: pre-eval-seed checkpoints stored a single int
+    if isinstance(seed, (int, np.integer)):
+        seed = (int(seed), int(np.random.randint(0, 100)))
+    return archive, gen, data['settings'], seed
 
 def load_alg(path) -> tuple:
     # reconstruct a fresh algorithm with the saved archive + gen restored, at the

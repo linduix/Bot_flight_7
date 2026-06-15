@@ -13,7 +13,8 @@
       "Bash(git rm *)",
       "Bash(python -c \"import inspect; from cmaes import SepCMA; print\\(inspect.signature\\(SepCMA.__init__\\)\\)\")",
       "Bash(python -c 'import ast,sys *)",
-      "Bash(python -m py_compile diagnostic.py showcase.py modules/simulation/sim1_visual.py)"
+      "Bash(python -m py_compile diagnostic.py showcase.py modules/simulation/sim1_visual.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('Trainer.py'\\).read\\(\\)\\); ast.parse\\(open\\('modules/evo_alg/mapElites.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
