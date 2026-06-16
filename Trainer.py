@@ -1,5 +1,5 @@
 from modules.individual import Individual
-from modules.evo_alg.mapElites import algorithm, save, load
+from modules.evo_alg.mapElites import algorithm, save, load, format_gen_log
 from modules.simulation.sim1 import sim, parallel_sim
 from multiprocessing.pool import Pool
 import numpy as np
@@ -108,30 +108,9 @@ if __name__=='__main__':
 
                 elapsed = time.perf_counter() - t0
 
-                # emit stats to logging
-                best = update_stats['archive_best'] if update_stats['archive_best'] is not None else 0.0
-                cov  = update_stats['coverage']
-                disc = update_stats['discoveries']
-                upd  = update_stats['updates']
-
-                print(f"\n=== gen {alg.gen} [{elapsed:.2f}s] ===")
-                print(f"  timing:     prop {t_prop:>5.2f}s | sim {t_sim:>5.2f}s | upd {t_upd:>5.2f}s")
-
-                # propose: active emitter counts
-                ps = propose_stats
-                active_str = f"active {ps['active']}  " + '  '.join(f"{k} {v}" for k, v in ps.items() if k != 'active')
-                print(f"  propose:    {active_str}")
-
-                # sim: per-batch fitness
-                print(f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}")
-
-                # update: archive churn + bandit reward this gen
-                score_str = ' | '.join(f"{k} {v:>6.2f}" for k, v in update_stats['bandit_score'].items())
-                print(f"  update:     coverage {cov:>4.2f} | discoveries {disc:>4d} | updates {upd:>4d} | best {best:>6.3f}")
-                print(f"              improvement: {score_str}", flush=True)
-
-                # curriculum: current difficulty
-                print(f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | progress {settings['curriculum_progress']} | perturbations {settings['perturbations']} | train_seed {train_seed} | eval_seed {eval_seed}", flush=True)
+                print(format_gen_log(alg.gen, elapsed, t_prop, t_sim, t_upd,
+                                     propose_stats, sim_stats, update_stats,
+                                     settings, train_seed, eval_seed), flush=True)
 
                 # pool transition branch:
                 if alg.gen % 50 == 0:

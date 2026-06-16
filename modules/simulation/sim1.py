@@ -209,9 +209,14 @@ def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int
 
     # replay buffer preallocation. tuple = (s, a, r, s'). last tick excluded from
     # sampling so s' is always valid. ticks_per_drone draws per (drone, seed) episode.
+    # ticks_per_drone < 0 (sentinel) -> record every tick (full-buffer mode).
     tuple_width = 2 * input_dim + action_dim + 1
     T_max = int(np.ceil(settings['limit'] / dt))
-    if ticks_per_drone > 0:
+    full_buffer = ticks_per_drone < 0
+    if full_buffer:
+        t_idx  = None
+        buffer = np.zeros((N, S, T_max - 1, tuple_width), dtype=np.float32)
+    elif ticks_per_drone > 0:
         t_idx = np.random.randint(0, T_max - 1, size=(N, S, ticks_per_drone))   # [0, T_max-1)
         buffer = np.zeros((N, S, ticks_per_drone, tuple_width), dtype=np.float32)
     else:
@@ -288,7 +293,7 @@ def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int
     crash_dist = 1.5 * settings['length']  # crash threshold: 1.5x chain length away from target
     # first-crash tick per (drone, seed). T_max sentinel = never crashed. used to drop
     # post-crash tuples from the replay buffer while keeping pre-crash ones.
-    crash_tick = np.full((N, S), T_max, dtype=np.int32) if ticks_per_drone > 0 else None
+    crash_tick = np.full((N, S), T_max, dtype=np.int32) if (ticks_per_drone > 0 or full_buffer) else None
 
     # TIME PRESSURE: ticks since the drone was last INSIDE the target (resets to 0 on
     # every touch, instantaneous — not the latched `toggle`). discount = touch_gamma **
@@ -578,6 +583,16 @@ def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int
                     n_i, s_i, k_i = np.where(match_rs)
                     buffer[n_i, s_i, k_i, input_dim + action_dim] = dt * score[n_i, s_i]
                     buffer[n_i, s_i, k_i, input_dim + action_dim + 1:] = obs[n_i, :, s_i]
+        elif full_buffer:
+            # full-buffer mode: at iteration total_ticks, obs=s_t, action=a_t.
+            # write (s_t, a_t) to slot total_ticks; write (r_{t-1}, s_t) to slot total_ticks-1.
+            if total_ticks < T_max - 1:
+                buffer[:, :, total_ticks, :input_dim] = obs.transpose(0, 2, 1)
+                buffer[:, :, total_ticks, input_dim:input_dim + action_dim] = action_matrix.transpose(0, 2, 1)
+            if 0 < total_ticks <= T_max - 1:
+                prev = total_ticks - 1
+                buffer[:, :, prev, input_dim + action_dim] = dt * score
+                buffer[:, :, prev, input_dim + action_dim + 1:] = obs.transpose(0, 2, 1)
 
         if log_per_tick:
             tick_fit            [:, :, total_ticks] = dt * score
@@ -616,6 +631,17 @@ def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int
     if buffer is not None and crash_tick is not None and t_idx is not None:
         valid  = t_idx < crash_tick[:, :, None]   # (N, S, ticks_per_drone)
         buffer = buffer[valid]                    # (n_valid, tuple_width)
+    elif buffer is not None and full_buffer:
+        # in full-buffer mode every tick has a slot; mask by both crash_tick and
+        # the actual loop length (covers early-exit when all pairs crashed).
+        K = buffer.shape[2]
+        tick_range = np.arange(K)[None, None, :]                          # (1,1,K)
+        # slot i has both (s,a) and (r,s') only if iter i+1 ran, i.e. i < total_ticks-1.
+        valid = tick_range < (total_ticks - 1)
+        if crash_tick is not None:
+            valid = valid & (tick_range < crash_tick[:, :, None])         # (N,S,K)
+        valid = np.broadcast_to(valid, buffer.shape[:3])
+        buffer = buffer[valid]                                            # (n_valid, tuple_width)
 
     # finalize descriptors and fitness
     var_acti = (sum_acti2 / total_ticks) - (sum_acti / total_ticks)**2 # (N, act, S)
@@ -681,7 +707,7 @@ def sim(individuals: list[Individual], settings, seed=None, ticks_per_drone: int
 
     return individuals, stats_out
 
-def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> tuple[list[Individual], dict]:
+def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None, full_buffer: bool = False) -> tuple[list[Individual], dict]:
     # get ocpu count
     cpus = os.cpu_count()
     cpus = 0 if cpus is None else cpus
@@ -696,6 +722,8 @@ def parallel_sim(indivs: list[Individual], settings, Mpool: Pool, seed=None) -> 
     S              = cfg['trainer']['trials']
     pop            = len(indivs)
     ticks_per_drone = -(-tuples_per_gen // (pop * S))  # ceil div
+    if full_buffer:
+        ticks_per_drone = -1  # sentinel -> sim() records every tick
 
     # create the chunks
     chunk_size = len(indivs) // max(cpus, 1)

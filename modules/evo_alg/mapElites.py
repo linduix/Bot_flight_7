@@ -317,6 +317,30 @@ def load_alg(path) -> tuple:
     alg.gen = gen
     return alg, settings, seed
 
+def format_gen_log(gen, elapsed, t_prop, t_sim, t_upd,
+                   propose_stats, sim_stats, update_stats,
+                   settings, train_seed, eval_seed):
+    best = update_stats['archive_best'] if update_stats['archive_best'] is not None else 0.0
+    cov  = update_stats['coverage']
+    disc = update_stats['discoveries']
+    upd  = update_stats['updates']
+
+    ps = propose_stats
+    active_str = f"active {ps['active']}  " + '  '.join(f"{k} {v}" for k, v in ps.items() if k != 'active')
+    score_str  = ' | '.join(f"{k} {v:>6.2f}" for k, v in update_stats['bandit_score'].items())
+
+    lines = [
+        f"\n=== gen {gen} [{elapsed:.2f}s] ===",
+        f"  timing:     prop {t_prop:>5.2f}s | sim {t_sim:>5.2f}s | upd {t_upd:>5.2f}s",
+        f"  propose:    {active_str}",
+        f"  sim:        fit_mean {sim_stats['fit_mean']:>6.3f} | fit_max {sim_stats['fit_max']:>6.3f}",
+        f"  update:     coverage {cov:>4.2f} | discoveries {disc:>4d} | updates {upd:>4d} | best {best:>6.3f}",
+        f"              improvement: {score_str}",
+        f"  curriculum: length {settings['length']:>5.2f} | limit {settings['limit']:>5.2f} | progress {settings['curriculum_progress']} | perturbations {settings['perturbations']} | train_seed {train_seed} | eval_seed {eval_seed}",
+    ]
+    return '\n'.join(lines)
+
+
 import signal as _signal
 def _worker_init():
     _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
